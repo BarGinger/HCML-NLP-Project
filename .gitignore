@@ -1,2 +1,4 @@
 .Rhistory
 __pycache__
+.idea/
+*.iml
