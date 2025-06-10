@@ -5,6 +5,25 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import LabelEncoder
 import lightgbm as lgb
 from sklearn.feature_selection import SelectFromModel
+import src.feature_extraction as feature_extraction # Assuming this is your custom module for feature extraction
+from gensim.models import Word2Vec
+import numpy as np
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.decomposition import PCA
+
+class GBM:
+    def __init__(self, model):
+        self.model = model
+
+    def fit(self, X, y):
+        self.model.fit(X, y)
+
+    def predict(self, X):
+        return self.model.predict(X)
+
+    def predict_proba(self, X):
+        return self.model.predict_proba(X)
 
 def count_lines(filepath):
     with open(filepath, 'r', encoding='utf-8') as f:
@@ -16,6 +35,8 @@ test_data = pd.read_csv('Data/drug_review_test_clean.csv')
 
 #Define the features (X) and the target variable (y)
 label = "rating"
+text_column = 'review_clean'
+
 X_train = train_data.drop(columns=[label])  # Drop the target column
 y_train = train_data[label]  # Target column
 X_val = val_data.drop(columns=[label])  # Drop the target column
@@ -23,51 +44,84 @@ y_val = val_data[label]  # Target columnX_train = train_data.drop(columns=[label
 X_test = test_data.drop(columns=[label])  # Drop the target column
 y_test = test_data[label]  # Target column
 
-print(print(pd.Series.nunique(X_train['drugName'])))
-
-# Get the text column (update if your text column has a different name)
-text_column = 'review'
-
 # Fill missing values
 X_train[text_column] = X_train[text_column].fillna("")
 X_val[text_column] = X_val[text_column].fillna("")
 X_test[text_column] = X_test[text_column].fillna("")
 
-# Initialize TF-IDF
-tfidf = TfidfVectorizer(max_features=5000)  # You can tune this
+def preprocess(df, tfidf_vectorizer=None, w2v_model=None, tfidf_weights=None, pca=None, fit=False):
+    df = df.copy()
+    df[text_column] = df[text_column].fillna("")
+    df['tokens'] = df[text_column].apply(lambda x: x.split())
+    if fit:
+        # Fit TF-IDF
+        tfidf_vectorizer = TfidfVectorizer()
+        tfidf_vectorizer.fit(df[text_column])
+        tfidf_weights = dict(zip(tfidf_vectorizer.get_feature_names_out(), tfidf_vectorizer.idf_))
+        # Fit Word2Vec
+        w2v_model = Word2Vec(sentences=df['tokens'], vector_size=100, window=5, min_count=2, workers=4)
+    vector_size = w2v_model.vector_size
 
-# Fit TF-IDF on training data and transform all sets
-X_train_tfidf = tfidf.fit_transform(X_train[text_column])
-X_val_tfidf = tfidf.transform(X_val[text_column])
-X_test_tfidf = tfidf.transform(X_test[text_column])
+    def tfidf_weighted_w2v(tokens):
+        vec = np.zeros(vector_size)
+        weight_sum = 0
+        for word in tokens:
+            if word in w2v_model.wv and word in tfidf_weights:
+                weight = tfidf_weights[word]
+                vec += w2v_model.wv[word] * weight
+                weight_sum += weight
+        return vec / weight_sum if weight_sum > 0 else vec
 
-def map_sentiment(rating):
-    if rating >= 7:
-        return 'positive'
-    elif rating >= 4:
-        return 'neutral'
+    # Document vectors
+    df_tfidf_w2v = np.vstack(df['tokens'].apply(tfidf_weighted_w2v))
+
+    # PCA on tfidf_w2v
+    n_components = 32  # You can adjust this number
+    if fit:
+        pca = PCA(n_components=n_components, random_state=42)
+        tfidf_w2v_pca = pca.fit_transform(df_tfidf_w2v)
     else:
-        return 'negative'
+        tfidf_w2v_pca = pca.transform(df_tfidf_w2v)
 
-y_train_sent = y_train.apply(map_sentiment)
-y_val_sent = y_val.apply(map_sentiment)
-y_test_sent = y_test.apply(map_sentiment)
+    # Sentiment scores
+    analyzer = SentimentIntensityAnalyzer()
+    sentiment_scores = df[text_column].apply(lambda text: analyzer.polarity_scores(text)['compound']).values.reshape(-1, 1)
 
-# Encode strings into integers
-le = LabelEncoder()
-y_train_enc = le.fit_transform(y_train_sent)
-y_val_enc = le.transform(y_val_sent)
-y_test_enc = le.transform(y_test_sent)
+    # Combine features
+    X_combined = np.hstack([df_tfidf_w2v, sentiment_scores])
+    return X_combined, tfidf_vectorizer, w2v_model, tfidf_weights, pca
 
-# Train LWGBM
-lgb_model = lgb.LGBMClassifier(n_estimators=100)
-lgb_model.fit(X_train_tfidf, y_train_enc)
+# Fit on train, transform all
+X_train_combined, tfidf_vectorizer, w2v_model, tfidf_weights, pca = preprocess(X_train, fit=True)
+X_val_combined, _, _, _, _ = preprocess(X_val, tfidf_vectorizer, w2v_model, tfidf_weights, pca, fit =False)
+X_test_combined, _, _, _, _ = preprocess(X_test, tfidf_vectorizer, w2v_model, tfidf_weights, pca, fit =False)
 
-# Select features based on importance
-selector = SelectFromModel(lgb_model, prefit=True, threshold='median')  # keep top 50%
-X_train_sel = selector.transform(X_train_tfidf)
-X_val_sel = selector.transform(X_val_tfidf)
-X_test_sel = selector.transform(X_test_tfidf)
+y_train = train_data[label]
+y_val = val_data[label]
+y_test = test_data[label]
+
+# Train LightGBM
+def apply_lgb(num_leaves=31, max_depth=-1, learning_rate=0.1, n_estimators=100, random_state=42):
+    lgb_model = lgb.LGBMRegressor(num_leaves=31, max_depth=-1, learning_rate=0.1, n_estimators=100, random_state=42)
+    lgb_model.fit(X_train_combined, y_train)
+    # Predict and evaluate
+    y_val_pred = lgb_model.predict(X_val_combined)
+    y_test_pred = lgb_model.predict(X_test_combined)
+
+    mae_val = mean_absolute_error(y_val, y_val_pred)
+    mse_val = mean_squared_error(y_val, y_val_pred)
+    mae_test = mean_absolute_error(y_test, y_test_pred)
+    mse_test =  mean_squared_error(y_test, y_test_pred)
+
+    print(f"Validation MAE: {mae_val:.4f}")
+    print(f"Validation MSE: {mse_val:.4f}")
+    print(f"Test MAE: {mae_test:.4f}")
+    print(f"Test MSE: {mse_test:.4f}")
+    return lgb_model
 
 
-
+# Feature importances
+#importances = lgb_model.feature_importances_
+#print("Top 10 Feature Importances:")
+#for idx in np.argsort(importances)[::-1][:10]:
+#    print(f"Feature {idx}: Importance {importances[idx]}")
