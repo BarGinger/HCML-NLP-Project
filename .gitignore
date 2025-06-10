@@ -2,3 +2,6 @@
 __pycache__
 *.ckpt
 *.pt
+.idea/
+*.iml
+main
