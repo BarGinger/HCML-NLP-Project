@@ -3,6 +3,7 @@ from GMB import apply_lgb
 import matplotlib.pyplot as plt
 import optuna.visualization as vis
 
+
 def objective(trial):
     num_leaves = trial.suggest_int('num_leaves', 20, 150)
     max_depth = trial.suggest_int('max_depth', -1, 10)
@@ -17,7 +18,9 @@ def objective(trial):
     )
 
     # Store test results for later analysis
-    trial.set_user_attr("test_mse", mse_test)
+    trial.set_user_attr("MAE_val", mae_val)
+    trial.set_user_attr("MSE_test", mse_test)
+    trial.set_user_attr("MAE_test", mae_test)
     return mse_val
 
 study = optuna.create_study(direction='minimize')
@@ -28,6 +31,9 @@ print(study.best_params)
 
 best_trial = study.best_trial
 print("Best validation MSE:", best_trial.value)
+print("Best validation MAE:", best_trial.user_attrs["MAE_val"])
 print("Best test MSE:", best_trial.user_attrs["MSE_test"])
+print("Best test MAE:", best_trial.user_attrs["MAE_test"])
 
 vis.plot_optimization_history(study).show()
+vis.plot_param_importances(study).show()
