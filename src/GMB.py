@@ -9,7 +9,7 @@ from sklearn.feature_selection import SelectFromModel
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.decomposition import PCA
-from src.feature_extraction import preprocess
+from feature_extraction import preprocess
 
 class GBM:
     def __init__(self, model):

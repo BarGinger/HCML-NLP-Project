@@ -4,10 +4,10 @@ import matplotlib.pyplot as plt
 import optuna.visualization as vis
 
 def objective(trial):
-    num_leaves = trial.suggest_int('num_leaves', 20, 100)
-    max_depth = trial.suggest_int('max_depth', -1, 20)
-    lr = trial.suggest_loguniform('lr', 1e-4, 1e-2)
-    n_estimators = trial.suggest_int('n_estimators', 50, 200)
+    num_leaves = trial.suggest_int('num_leaves', 20, 150)
+    max_depth = trial.suggest_int('max_depth', -1, 10)
+    lr = trial.suggest_loguniform('lr', 1e-3, 1e-2)
+    n_estimators = trial.suggest_int('n_estimators', 100, 200)
 
     mae_val, mse_val, mae_test, mse_test = apply_lgb(
         num_leaves = num_leaves,
@@ -17,18 +17,17 @@ def objective(trial):
     )
 
     # Store test results for later analysis
-    trial.set_user_attr("test_accuracies", mse_test)
+    trial.set_user_attr("test_mse", mse_test)
     return mse_val
 
-study = optuna.create_study(direction='maximize')
+study = optuna.create_study(direction='minimize')
 study.optimize(objective, n_trials=2)
 
 print("Best hyperparameters:")
 print(study.best_params)
 
 best_trial = study.best_trial
-print("Best validation accuracy:", best_trial.value)
-print("Best test accuracies per subject:", best_trial.user_attrs["test_accuracies"])
-print("Best overall test accuracy:", best_trial.user_attrs["overall_test_accuracy"])
+print("Best validation MSE:", best_trial.value)
+print("Best test MSE:", best_trial.user_attrs["MSE_test"])
 
 vis.plot_optimization_history(study).show()
