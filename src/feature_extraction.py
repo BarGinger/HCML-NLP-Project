@@ -6,7 +6,7 @@ from gensim.models import Word2Vec
 
 def preprocess(df, tfidf_vectorizer=None, w2v_model=None, tfidf_weights=None, pca=None, fit=False):
     df = df.copy()
-    text_column = df['review_clean']
+    text_column = 'review_clean'
     df[text_column] = df[text_column].fillna("")
     df['tokens'] = df[text_column].apply(lambda x: x.split())
     if fit:

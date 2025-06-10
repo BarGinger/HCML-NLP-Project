@@ -46,8 +46,8 @@ X_val_combined, _, _, _, _ = preprocess(X_val, tfidf_vectorizer, w2v_model, tfid
 X_test_combined, _, _, _, _ = preprocess(X_test, tfidf_vectorizer, w2v_model, tfidf_weights, pca, fit =False)
 
 # Train LightGBM
-def apply_lgb(num_leaves=31, max_depth=-1, learning_rate=0.1, n_estimators=100, random_state=42):
-    lgb_model = lgb.LGBMRegressor(num_leaves=31, max_depth=-1, learning_rate=0.1, n_estimators=100, random_state=42)
+def apply_lgb(num_leaves=31, max_depth=-1, learning_rate=0.1, n_estimators=100):
+    lgb_model = lgb.LGBMRegressor(num_leaves=num_leaves, max_depth=max_depth, learning_rate=learning_rate, n_estimators=n_estimators)
     lgb_model.fit(X_train_combined, y_train)
     # Predict and evaluate
     y_val_pred = lgb_model.predict(X_val_combined)
@@ -58,12 +58,13 @@ def apply_lgb(num_leaves=31, max_depth=-1, learning_rate=0.1, n_estimators=100, 
     mae_test = mean_absolute_error(y_test, y_test_pred)
     mse_test =  mean_squared_error(y_test, y_test_pred)
 
-    print(f"Validation MAE: {mae_val:.4f}")
-    print(f"Validation MSE: {mse_val:.4f}")
-    print(f"Test MAE: {mae_test:.4f}")
-    print(f"Test MSE: {mse_test:.4f}")
-    return lgb_model
+    return mae_val, mse_val, mae_test, mse_test
 
+mae_val, mse_val, mae_test, mse_test = apply_lgb(num_leaves=31, max_depth=-1, learning_rate=0.1, n_estimators=100)
+print(f"Validation MAE: {mae_val:.4f}")
+print(f"Validation MSE: {mse_val:.4f}")
+print(f"Test MAE: {mae_test:.4f}")
+print(f"Test MSE: {mse_test:.4f}")
 
 # Feature importances
 #importances = lgb_model.feature_importances_
