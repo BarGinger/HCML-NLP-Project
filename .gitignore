@@ -2,3 +2,6 @@
 __pycache__
 .idea/
 *.iml
+*.vsidx
+/GBM/.vs/GBM
+/GBM/GBM
