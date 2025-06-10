@@ -132,30 +132,86 @@ class proto_lm(pl.LightningModule):
        return alphas, all_S, all_sims
 
 
+    # def forward(self, **inputs):
+    #     #in case the key 'labels' is part of the kwarg input, delete it, because it can't be handled by the base model
+    #     if 'labels' in inputs.keys():
+    #         del inputs['labels']
+
+    #     llm_out = self.LLM(**inputs, output_hidden_states=True)
+    #     last_hidden_states = llm_out.hidden_states[-1]
+    #     alphas, proto_hiddens, similarities = self.hierarchical_attention_calculation(last_hidden_states)
+
+    #     # similiarities, sim_windows = get_sims_for_prototypes(hidden_states,self.prototypes, return_windows=self.hparams.analyze_mode)
+    #     logits = self.dense(similarities)
+    #     probs = F.softmax(logits, dim=1)
+
+    #     out_dict = {
+    #         'loss':None, #loss is calculated in another function
+    #         'probs':probs,
+    #         'logits':logits.detach().clone() if self.hparams.analyze_mode else logits,
+    #         'hidden_states':last_hidden_states,
+    #         'llm_attention':llm_out, #can specificy attention here
+    #         'alphas': alphas,
+    #         'proto_hiddens': proto_hiddens,
+    #         'similarities': similarities
+    #     }
+
+
+    #     return out_dict
+
     def forward(self, **inputs):
-        #in case the key 'labels' is part of the kwarg input, delete it, because it can't be handled by the base model
+        """
+        Forward pass for the Proto-LM model.
+
+        Args:
+            inputs: Keyword arguments, including:
+                - input_ids: Tensor of token IDs.
+                - attention_mask: Tensor of attention masks.
+                - sentiment_features (optional): Tensor of sentiment features.
+                - labels (optional): Tensor of labels (removed before passing to LLM).
+
+        Returns:
+            dict: Output dictionary containing logits, probabilities, and other intermediate results.
+        """
+        # Remove 'labels' from inputs if present, as it cannot be handled by the base model
         if 'labels' in inputs.keys():
             del inputs['labels']
 
-        llm_out = self.LLM(**inputs, output_hidden_states=True)
+        # Extract sentiment features if provided
+        sentiment_features = inputs.pop('sentiment_features', None)
+
+        # Filter out sentiment-related keys before passing to the LLM
+        llm_inputs = {key: value for key, value in inputs.items() if key in ['input_ids', 'attention_mask', 'token_type_ids']}
+
+        # Pass inputs to the pretrained language model (LLM)
+        llm_out = self.LLM(**llm_inputs, output_hidden_states=True)
         last_hidden_states = llm_out.hidden_states[-1]
+
+        # Perform hierarchical attention calculation
         alphas, proto_hiddens, similarities = self.hierarchical_attention_calculation(last_hidden_states)
 
-        # similiarities, sim_windows = get_sims_for_prototypes(hidden_states,self.prototypes, return_windows=self.hparams.analyze_mode)
-        logits = self.dense(similarities)
+        # If sentiment features are provided, concatenate them with prototype similarities
+        if sentiment_features is not None:
+            sentiment_features = sentiment_features.to(similarities.device)
+            combined_features = torch.cat((similarities, sentiment_features), dim=1)
+        else:
+            combined_features = similarities
+
+        # Compute logits using the dense layer
+        logits = self.dense(combined_features)
         probs = F.softmax(logits, dim=1)
 
+        # Prepare the output dictionary
         out_dict = {
-            'loss':None, #loss is calculated in another function
-            'probs':probs,
-            'logits':logits.detach().clone() if self.hparams.analyze_mode else logits,
-            'hidden_states':last_hidden_states,
-            'llm_attention':llm_out, #can specificy attention here
+            'loss': None,  # Loss is calculated in another function
+            'probs': probs,
+            'logits': logits.detach().clone() if self.hparams.analyze_mode else logits,
+            'hidden_states': last_hidden_states,
+            'llm_attention': llm_out,  # Can specify attention here
             'alphas': alphas,
             'proto_hiddens': proto_hiddens,
             'similarities': similarities
         }
-
 
         return out_dict
 
