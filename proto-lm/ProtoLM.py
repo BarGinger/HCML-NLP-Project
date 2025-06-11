@@ -64,21 +64,31 @@ class proto_lm(pl.LightningModule):
         self.W_nu = nn.Parameter(torch.randn(size=(self.hidden_shape, 1)))
 
         #dense layer connecting attention/similarity scores to classes
-        self.dense = torch.nn.Linear(self.hparams.num_prototypes, self.hparams.num_classes)
+        # self.dense = torch.nn.Linear(self.hparams.num_prototypes, self.hparams.num_classes)
+        self.dense = torch.nn.Linear(self.hparams.num_prototypes + 4, self.hparams.num_classes) ## added +4 for sentiment features
 
         #if we're in the prototype training stage, initialize weights for pos/neg association for each class
         self.initialize_weights_for_prototype_training()
         self.set_grads_for_proto_train()
         self.misclassified = []
 
-    def initialize_weights_for_prototype_training(self, negative_assoc=-.5):
+    def initialize_weights_for_prototype_training(self, negative_assoc=-0.5):
+        # Transpose the prototype class vector
         positive_one_weights_locations = torch.t(self.prototype_class_vec)
+
+        # Pad the prototype class vector with zeros for sentiment features
+        padding = torch.zeros(self.hparams.num_classes, 4)  # 4 for sentiment features
+        positive_one_weights_locations = torch.cat((positive_one_weights_locations, padding), dim=1)
+
+        # Create the negative association weights
         negative_one_weights_locations = 1 - positive_one_weights_locations
 
+        # Initialize the dense layer weights
         positive_assoc = 1
         self.dense.weight.data.copy_(
             positive_assoc * positive_one_weights_locations
-            + negative_assoc * negative_one_weights_locations)
+            + negative_assoc * negative_one_weights_locations
+        )
 
     def set_grads_for_proto_train(self):
         for p in self.LLM.parameters():
@@ -191,11 +201,14 @@ class proto_lm(pl.LightningModule):
         alphas, proto_hiddens, similarities = self.hierarchical_attention_calculation(last_hidden_states)
 
         # If sentiment features are provided, concatenate them with prototype similarities
+        # print(f"similarities shape: {similarities.shape}")
         if sentiment_features is not None:
+            # print(f"sentiment_features shape: {sentiment_features.shape}")
             sentiment_features = sentiment_features.to(similarities.device)
             combined_features = torch.cat((similarities, sentiment_features), dim=1)
         else:
             combined_features = similarities
+        # print(f"combined_features shape: {combined_features.shape}")
 
         # Compute logits using the dense layer
         logits = self.dense(combined_features)
