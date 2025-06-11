@@ -1,15 +1,8 @@
 
-import os
 import pandas as pd
-import numpy as np
 import lightgbm as lgb
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.preprocessing import LabelEncoder
-from sklearn.feature_selection import SelectFromModel
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from sklearn.metrics import mean_absolute_error, mean_squared_error
-from sklearn.decomposition import PCA
-from feature_extraction import preprocess
+from feature_extraction import feature_extraction
 
 class GBM:
     def __init__(self, model):
@@ -41,12 +34,12 @@ X_test = test_data.drop(columns=[label])
 y_test = test_data[label]  
 
 # Fit on train, transform all
-X_train_combined, tfidf_vectorizer, w2v_model, tfidf_weights, pca = preprocess(X_train, fit=True)
-X_val_combined, _, _, _, _ = preprocess(X_val, tfidf_vectorizer, w2v_model, tfidf_weights, pca, fit =False)
-X_test_combined, _, _, _, _ = preprocess(X_test, tfidf_vectorizer, w2v_model, tfidf_weights, pca, fit =False)
+X_train_combined, tfidf_vectorizer, w2v_model, tfidf_weights, pca = feature_extraction(X_train, fit=True)
+X_val_combined, _, _, _, _ = feature_extraction(X_val, tfidf_vectorizer, w2v_model, tfidf_weights, pca, fit =False)
+X_test_combined, _, _, _, _ = feature_extraction(X_test, tfidf_vectorizer, w2v_model, tfidf_weights, pca, fit =False)
 
 # Train LightGBM
-def apply_lgb(num_leaves=31, max_depth=-1, learning_rate=0.1, n_estimators=100):
+def apply_lgb(num_leaves=47, max_depth=9, learning_rate=0.0998, n_estimators=199):
     lgb_model = lgb.LGBMRegressor(num_leaves=num_leaves, max_depth=max_depth, learning_rate=learning_rate, n_estimators=n_estimators)
     lgb_model.fit(X_train_combined, y_train)
     # Predict and evaluate
@@ -59,6 +52,7 @@ def apply_lgb(num_leaves=31, max_depth=-1, learning_rate=0.1, n_estimators=100):
     mse_test =  mean_squared_error(y_test, y_test_pred)
 
     return mae_val, mse_val, mae_test, mse_test
+
 
 mae_val, mse_val, mae_test, mse_test = apply_lgb(num_leaves=31, max_depth=-1, learning_rate=0.1, n_estimators=100)
 print(f"Validation MAE: {mae_val:.4f}")
