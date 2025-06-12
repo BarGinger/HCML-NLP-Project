@@ -11,7 +11,7 @@ def objective(trial):
     lr = trial.suggest_loguniform('lr', 1e-2, 1e-1)
     n_estimators = trial.suggest_int('n_estimators', 100, 200)
 
-    mae_val, mse_val, mae_test, mse_test = apply_lgb(
+    mae_val, mse_val, mae_test, mse_test, _ = apply_lgb(
         num_leaves = num_leaves,
         max_depth = max_depth, 
         learning_rate = lr, 

@@ -2,9 +2,10 @@ from sklearn.decomposition import PCA
 from sklearn.feature_extraction.text import TfidfVectorizer
 import numpy as np
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-from gensim.models import Word2Vec
+from sklearn.decomposition import TruncatedSVD
+#from gensim.models import Word2Vec
 
-def feature_extraction(df, tfidf_vectorizer=None, tfidf_weights=None, pca=None, fit=False):
+def feature_extraction(df, tfidf_vectorizer=None, svd=None, fit=False):
     df = df.copy()
     text_column = 'review_clean'
     df[text_column] = df[text_column].fillna("")
@@ -19,7 +20,7 @@ def feature_extraction(df, tfidf_vectorizer=None, tfidf_weights=None, pca=None, 
         # Fit Word2Vec
         #w2v_model = Word2Vec(sentences=df['tokens'], vector_size=100, window=5, min_count=2, workers=4)
     else:
-        tfidf_features = tfidf_vectorizer.transform(df[text_column])    #vector_size = w2v_model.vector_size
+        tfidf_features = tfidf_vectorizer.transform(df[text_column])
 
     '''	
     def tfidf_weighted_w2v(tokens):
@@ -44,19 +45,27 @@ def feature_extraction(df, tfidf_vectorizer=None, tfidf_weights=None, pca=None, 
         tfidf_w2v_pca = pca.transform(df_tfidf_w2v)
         '''
     #PCA on TF-IDF features
-    n_components = 32  # Adjust as needed
+    n_components = 10  # Adjust as needed
+
+    ''' 
     if fit:
         pca = PCA(n_components=n_components, random_state=42)
         tfidf_pca = pca.fit_transform(tfidf_features.toarray())
     else:
         tfidf_pca = pca.transform(tfidf_features.toarray())
+    '''	
+    if fit:
+        svd = TruncatedSVD(n_components=n_components, random_state=42)
+        tfidf_svd = svd.fit_transform(tfidf_features)
+    else:
+        tfidf_svd = svd.transform(tfidf_features)
 
     # Sentiment scores
     analyzer = SentimentIntensityAnalyzer()
     sentiment_scores = df[text_column].apply(lambda text: analyzer.polarity_scores(text)['compound']).values.reshape(-1, 1)
 
     # Combine features
-    X_combined = np.hstack([tfidf_pca, sentiment_scores])
-    return X_combined, tfidf_vectorizer, tfidf_weights, pca
+    X_combined = np.hstack([tfidf_svd, sentiment_scores])
+    return X_combined, tfidf_vectorizer, svd
 
 
