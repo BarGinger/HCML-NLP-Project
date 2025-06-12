@@ -1,0 +1,39 @@
+import optuna
+from GMB import apply_lgb
+import matplotlib.pyplot as plt
+import optuna.visualization as vis
+
+
+def objective(trial):
+    num_leaves = trial.suggest_int('num_leaves', 20, 150)
+    max_depth = trial.suggest_int('max_depth', -1, 10)
+    lr = trial.suggest_loguniform('lr', 1e-3, 1e-2)
+    n_estimators = trial.suggest_int('n_estimators', 100, 200)
+
+    mae_val, mse_val, mae_test, mse_test = apply_lgb(
+        num_leaves = num_leaves,
+        max_depth = max_depth, 
+        learning_rate = lr, 
+        n_estimators = n_estimators
+    )
+
+    # Store test results for later analysis
+    trial.set_user_attr("MAE_val", mae_val)
+    trial.set_user_attr("MSE_test", mse_test)
+    trial.set_user_attr("MAE_test", mae_test)
+    return mse_val
+
+study = optuna.create_study(direction='minimize')
+study.optimize(objective, n_trials=2)
+
+print("Best hyperparameters:")
+print(study.best_params)
+
+best_trial = study.best_trial
+print("Best validation MSE:", best_trial.value)
+print("Best validation MAE:", best_trial.user_attrs["MAE_val"])
+print("Best test MSE:", best_trial.user_attrs["MSE_test"])
+print("Best test MAE:", best_trial.user_attrs["MAE_test"])
+
+vis.plot_optimization_history(study).show()
+vis.plot_param_importances(study).show()
