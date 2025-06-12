@@ -44,7 +44,7 @@ def clean_text(text: str) -> str:
         if (not token.is_stop and
             not token.is_punct and
             not token.like_num and
-            is_essentially_alpha_or_hyphenated_word and # Using the more lenient check
+            is_essentially_alpha_or_hyphenated_word and
             len(token.lemma_) > 1):
             clean_tokens.append(token.lemma_)
 
@@ -55,6 +55,29 @@ def clean_text(text: str) -> str:
 
 
 def preprocess_dataframe(df, text_column="review", new_column="review_clean"):
+    # this func is just for efficiency
+    texts = []
+    for text in df[text_column].fillna("").astype(str):
+        try:
+            text = contractions.fix(text)  # e.g., I'm -> I am
+        except Exception:
+            pass
+        text = text.lower()
+        text = re.sub(r'http\S+|www\S+|https\S+', '', text, flags=re.MULTILINE)  # remove URLs
+        text = re.sub(r'\S*@\S*\s?', '', text)  # remove emails
+        text = re.sub(r'[^\w\s-]', '', text)  # remove special characters
+        texts.append(text)
+    final_clean_texts = []
+    for doc in nlp.pipe(texts):
+        clean_tokens = [
+            token.lemma_ for token in doc
+            if not token.is_stop and
+               not token.is_punct and
+               not token.like_num and
+               len(token.lemma_) > 1 and
+               token.is_alpha
+        ]
+        final_clean_texts.append(" ".join(clean_tokens))
 
-    df[new_column] = df[text_column].fillna("").astype(str).apply(clean_text)
+    df[new_column] = final_clean_texts
     return df
