@@ -2,22 +2,27 @@ from sklearn.decomposition import PCA
 from sklearn.feature_extraction.text import TfidfVectorizer
 import numpy as np
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-from gensim.models import Word2Vec
+from sklearn.decomposition import TruncatedSVD
+#from gensim.models import Word2Vec
 
-def preprocess(df, tfidf_vectorizer=None, w2v_model=None, tfidf_weights=None, pca=None, fit=False):
+def feature_extraction(df, tfidf_vectorizer=None, svd=None, fit=False):
     df = df.copy()
     text_column = 'review_clean'
     df[text_column] = df[text_column].fillna("")
-    df['tokens'] = df[text_column].apply(lambda x: x.split())
+    #df['tokens'] = df[text_column].apply(lambda x: x.split())
+
     if fit:
         # Fit TF-IDF
         tfidf_vectorizer = TfidfVectorizer()
-        tfidf_vectorizer.fit(df[text_column])
-        tfidf_weights = dict(zip(tfidf_vectorizer.get_feature_names_out(), tfidf_vectorizer.idf_))
+        tfidf_features = tfidf_vectorizer.fit_transform(df[text_column])
+        #tfidf_vectorizer.fit(df[text_column])
+        #tfidf_weights = dict(zip(tfidf_vectorizer.get_feature_names_out(), tfidf_vectorizer.idf_))
         # Fit Word2Vec
-        w2v_model = Word2Vec(sentences=df['tokens'], vector_size=100, window=5, min_count=2, workers=4)
-    vector_size = w2v_model.vector_size
+        #w2v_model = Word2Vec(sentences=df['tokens'], vector_size=100, window=5, min_count=2, workers=4)
+    else:
+        tfidf_features = tfidf_vectorizer.transform(df[text_column])
 
+    '''	
     def tfidf_weighted_w2v(tokens):
         vec = np.zeros(vector_size)
         weight_sum = 0
@@ -38,13 +43,27 @@ def preprocess(df, tfidf_vectorizer=None, w2v_model=None, tfidf_weights=None, pc
         tfidf_w2v_pca = pca.fit_transform(df_tfidf_w2v)
     else:
         tfidf_w2v_pca = pca.transform(df_tfidf_w2v)
+        '''
+    #PCA on TF-IDF features
+    n_components = 10  # Adjust as needed
+
+    ''' 
+    if fit:
+        pca = PCA(n_components=n_components, random_state=42)
+        tfidf_pca = pca.fit_transform(tfidf_features.toarray())
+    else:
+        tfidf_pca = pca.transform(tfidf_features.toarray())
+    '''	
+    if fit:
+        svd = TruncatedSVD(n_components=n_components, random_state=42)
+        tfidf_svd = svd.fit_transform(tfidf_features)
+    else:
+        tfidf_svd = svd.transform(tfidf_features)
 
     # Sentiment scores
     analyzer = SentimentIntensityAnalyzer()
     sentiment_scores = df[text_column].apply(lambda text: analyzer.polarity_scores(text)['compound']).values.reshape(-1, 1)
 
     # Combine features
-    X_combined = np.hstack([df_tfidf_w2v, sentiment_scores])
-    return X_combined, tfidf_vectorizer, w2v_model, tfidf_weights, pca
-
-
+    X_combined = np.hstack([tfidf_svd, sentiment_scores])
+    return X_combined, tfidf_vectorizer, svd
