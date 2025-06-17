@@ -45,7 +45,7 @@ def feature_extraction(df, tfidf_vectorizer=None, svd=None, fit=False):
         tfidf_w2v_pca = pca.transform(df_tfidf_w2v)
         '''
     #PCA on TF-IDF features
-    n_components = 10  # Adjust as needed
+    n_components = 32  # Adjust as needed
 
     ''' 
     if fit:

@@ -62,6 +62,7 @@ print(f"Validation MSE: {mse_val:.4f}")
 print(f"Test MAE: {mae_test:.4f}")
 print(f"Test MSE: {mse_test:.4f}")
 
+'''
 # Feature importances
 importances = lgb_model.feature_importances_
 feature_names = tfidf_vectorizer.get_feature_names_out()
@@ -133,3 +134,4 @@ for instance_idx, label in zip([high_pos, low_pos], ["High score", "Low score"])
         )
     )
     print(f"SHAP force plot saved as shap_force_plot_{label.replace(' ', '_').lower()}.html")
+    '''
