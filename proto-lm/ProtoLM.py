@@ -28,6 +28,11 @@ class proto_lm(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters(ignore='pretrained_model')
 
+        # Store max_seq_length as an attribute
+        self.max_seq_length = max_seq_length  
+        self.num_classes = num_classes  
+        self.num_prototypes = num_prototypes  
+
         #get model obj
         self.LLM = pretrained_model
 
@@ -178,6 +183,7 @@ class proto_lm(pl.LightningModule):
                 - input_ids: Tensor of token IDs.
                 - attention_mask: Tensor of attention masks.
                 - sentiment_features (optional): Tensor of sentiment features.
+                - inputs_embeds (optional): Tensor of input embeddings.
                 - labels (optional): Tensor of labels (removed before passing to LLM).
 
         Returns:
@@ -190,29 +196,73 @@ class proto_lm(pl.LightningModule):
         # Extract sentiment features if provided
         sentiment_features = inputs.pop('sentiment_features', None)
 
-        # Filter out sentiment-related keys before passing to the LLM
-        llm_inputs = {key: value for key, value in inputs.items() if key in ['input_ids', 'attention_mask', 'token_type_ids']}
+        # Determine if using embeddings
+        inputs_embeds = inputs.get("inputs_embeds", None)
+        input_ids = inputs.get("input_ids", None)
+        attention_mask = inputs.get("attention_mask", None)
+
+        # Debugging: Print input shapes
+        # print(f"ProtoLM.forward() called with:")
+        # print(f"  input_ids shape: {input_ids.shape if input_ids is not None else None}")
+        # print(f"  inputs_embeds shape: {inputs_embeds.shape if inputs_embeds is not None else None}")
+        # print(f"  attention_mask shape: {inputs.get('attention_mask', None).shape if inputs.get('attention_mask', None) is not None else None}")
+        # print(f"  sentiment_features shape: {sentiment_features.shape if sentiment_features is not None else None}")
+
+        # Ensure only one of input_ids or inputs_embeds is passed
+        if inputs_embeds is not None:
+            # If inputs_embeds is provided, ensure attention_mask matches its shape
+            if attention_mask is None:
+                raise ValueError("attention_mask must be provided when using inputs_embeds.")
+            if attention_mask.shape[1] != inputs_embeds.shape[1]:
+                raise ValueError("attention_mask must match the sequence length of inputs_embeds.")
+            llm_inputs = {
+                "inputs_embeds": inputs_embeds.to(self.device),
+                "attention_mask": attention_mask.to(self.device),
+                "token_type_ids": inputs.get("token_type_ids", None),
+            }
+        elif input_ids is not None:
+            llm_inputs = {
+                "input_ids": input_ids.to(self.device),
+                "attention_mask": attention_mask.to(self.device) if attention_mask is not None else None,
+                "token_type_ids": inputs.get("token_type_ids", None),
+            }
+        else:
+            raise ValueError("Either input_ids or inputs_embeds must be provided.")
 
         # Pass inputs to the pretrained language model (LLM)
         llm_out = self.LLM(**llm_inputs, output_hidden_states=True)
+
+        # if inputs_embeds is not None and attention_mask is not None:
+        #     llm_out = self.LLM(inputs_embeds=inputs_embeds, attention_mask=attention_mask, output_hidden_states=True)
+        # else:
+        #     llm_out = self.LLM(**llm_inputs, output_hidden_states=True)
+
         last_hidden_states = llm_out.hidden_states[-1]
+
+        # Debugging: Print shape of last_hidden_states
+        # print(f"  last_hidden_states shape: {last_hidden_states.shape}")
 
         # Perform hierarchical attention calculation
         alphas, proto_hiddens, similarities = self.hierarchical_attention_calculation(last_hidden_states)
 
+        # Debugging: Print shape of similarities
+        # print(f"  similarities shape: {similarities.shape}")
+
         # If sentiment features are provided, concatenate them with prototype similarities
-        # print(f"similarities shape: {similarities.shape}")
         if sentiment_features is not None:
-            # print(f"sentiment_features shape: {sentiment_features.shape}")
             sentiment_features = sentiment_features.to(similarities.device)
             combined_features = torch.cat((similarities, sentiment_features), dim=1)
+            # Debugging: Print shape of combined_features
+            # print(f"  combined_features shape (after concatenation): {combined_features.shape}")
         else:
             combined_features = similarities
-        # print(f"combined_features shape: {combined_features.shape}")
 
         # Compute logits using the dense layer
         logits = self.dense(combined_features)
         probs = F.softmax(logits, dim=1)
+
+        # Debugging: Print shape of logits
+        # print(f"  logits shape: {logits.shape}")
 
         # Prepare the output dictionary
         out_dict = {
