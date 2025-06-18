@@ -803,7 +803,8 @@ def evaluate_lgb_model(model_filename, X_test_combined, y_test, metrics=None, us
     results_df = pd.DataFrame(results)
 
     # Ensure the output directory exists
-    output_csv = f"{EVAL_DIR}/{model_name}_evaluation_scores.csv"
+    timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+    output_csv = f"{EVAL_DIR}/{model_name}_evaluation_scores_{timestamp}.csv"
     os.makedirs(os.path.dirname(output_csv), exist_ok=True)
 
     # Export results to CSV
