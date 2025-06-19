@@ -1,64 +1,48 @@
 import pandas as pd
 import numpy as np
-from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import Lasso
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-from scipy.sparse import hstack
-from sklearn.decomposition import TruncatedSVD
-from feature_extraction import feature_extraction
 from sklearn.model_selection import train_test_split
 import optuna
 
+def feature_extraction(df, tfidf_vectorizer=None, fit=False):
+    df = df.copy()
+    text_column = 'review_clean'
+    df[text_column] = df[text_column].fillna("")
 
+    if fit:
+        tfidf_vectorizer = TfidfVectorizer(max_features=10000)
+        tfidf_features = tfidf_vectorizer.fit_transform(df[text_column])
+    else:
+        tfidf_features = tfidf_vectorizer.transform(df[text_column])
+
+    analyzer = SentimentIntensityAnalyzer()
+    sentiment_scores = df[text_column].apply(lambda text: analyzer.polarity_scores(text)['compound']).values.reshape(-1, 1)
+
+    return tfidf_features, sentiment_scores, tfidf_vectorizer
 
 def run_lasso_model(df, target_column='rating', test_size=0.2, alpha=0.01):
-    # Step 1: Feature extraction with fit=True
-    X, tfidf_vectorizer, svd = feature_extraction(df, fit=True)
+    tfidf_features, sentiment_scores, tfidf_vectorizer = feature_extraction(df, fit=True)
 
-    # Step 2: Train-test split
+    # Combine TF-IDF features (sparse matrix) and sentiment scores (dense)
+    from scipy.sparse import hstack
+    X_combined = hstack([tfidf_features, sentiment_scores])
+
     y = df[target_column].values
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42)
 
-    # Step 3: Train Lasso model
+    X_train, X_test, y_train, y_test = train_test_split(X_combined, y, test_size=test_size, random_state=42)
+
     lasso = Lasso(alpha=alpha, max_iter=1000)
-    lasso.fit(X_train, y_train)
+    lasso.fit(X_train.toarray(), y_train)  # Lasso needs dense arrays
 
-    # Step 4: Predict and evaluate
-    y_pred = lasso.predict(X_test)
+    y_pred = lasso.predict(X_test.toarray())
     mse = mean_squared_error(y_test, y_pred)
     print("MSE:", mse)
 
-    return lasso, tfidf_vectorizer, svd, X_test, y_test, y_pred
+    return lasso, tfidf_vectorizer, X_test, y_test, y_pred
 
-
-
-
-
-
-
-
-def evaluate_lasso_model(y_test, y_pred):
-    print("MSE:", mean_squared_error(y_test, y_pred))
-    print("MAE:", mean_absolute_error(y_test, y_pred))
-    print("R² Score:", r2_score(y_test, y_pred))
-
-def analyze_lasso_coefficients(lasso_model, svd_model, tfidf_vectorizer):
-    # Get original TF-IDF feature names
-    feature_names = tfidf_vectorizer.get_feature_names_out()
-
-    # SVD components: n_components x n_original_features
-    # Coefficients from Lasso correspond to SVD dimensions + sentiment
-    tfidf_feature_contributions = lasso_model.coef_[:-1]  # Exclude last sentiment feature
-    sentiment_coef = lasso_model.coef_[-1]                # Last one is sentiment
-
-    print("Sentiment coefficient:", sentiment_coef)
-    print("\nTop TF-IDF SVD component contributions:")
-
-    for i, coef in enumerate(tfidf_feature_contributions):
-        print(f"Component {i}: Coef = {coef:.4f}")
-
-        
 def print_top_words_per_svd_component(svd_model, tfidf_vectorizer, top_n=10, show_weights=True, show_positive_and_negative=False):
     terms = tfidf_vectorizer.get_feature_names_out()
     
@@ -99,8 +83,6 @@ def print_top_words_per_svd_component(svd_model, tfidf_vectorizer, top_n=10, sho
                 else:
                     print(f"    {term}")
 
-
-
 def print_top_features_by_absolute_weight(lasso_model, svd_model, tfidf_vectorizer, top_n=10):
     import numpy as np
 
@@ -123,60 +105,67 @@ def print_top_features_by_absolute_weight(lasso_model, svd_model, tfidf_vectoriz
     for idx in top_word_indices:
         print(f"{terms[idx]}: {word_scores[idx]:.4f}")
 
+def print_most_important_features(lasso_model, tfidf_vectorizer, top_n=20):
+    feature_names = list(tfidf_vectorizer.get_feature_names_out()) + ['sentiment_score']
+    coefs = lasso_model.coef_
+
+    print(f"Total number of features (including sentiment score): {len(feature_names)}\n")
+
+    # Sort features by absolute coefficient value
+    coef_df = pd.DataFrame({'feature': feature_names, 'coefficient': coefs})
+    coef_df['abs_coef'] = coef_df['coefficient'].abs()
+    coef_df = coef_df.sort_values(by='abs_coef', ascending=False)
+
+    print(f"Top {top_n} most important features by absolute coefficient:\n")
+    for _, row in coef_df.head(top_n).iterrows():
+        sign = '+' if row['coefficient'] > 0 else '-'
+        print(f"{row['feature']}: {sign}{abs(row['coefficient']):.4f}")
 
 
+
+
+def evaluate_lasso_model(y_test, y_pred):
+    print("MSE:", mean_squared_error(y_test, y_pred))
+    print("MAE:", mean_absolute_error(y_test, y_pred))
+    print("R² Score:", r2_score(y_test, y_pred))
+
+def analyze_lasso_coefficients(lasso_model, tfidf_vectorizer):
+    feature_names = list(tfidf_vectorizer.get_feature_names_out()) + ['sentiment_score']
+    coefs = lasso_model.coef_
+    coef_df = pd.DataFrame({'feature': feature_names, 'coefficient': coefs})
+    coef_df = coef_df.sort_values(by='coefficient', ascending=False)
+    print(coef_df.head(20))
+    print("\nTop negative coefficients:")
+    print(coef_df.tail(20))
 
 def run_lasso_with_optuna(df, target_column='rating', test_size=0.2, n_trials=30):
-    from sklearn.model_selection import train_test_split
-    from sklearn.linear_model import Lasso
-    from sklearn.metrics import mean_squared_error, mean_absolute_error
-    import optuna
-
-    # Step 1: Extract features
-    X, tfidf_vectorizer, svd = feature_extraction(df, fit=True)
+    tfidf_features, sentiment_scores, tfidf_vectorizer = feature_extraction(df, fit=True)
+    from scipy.sparse import hstack
+    X_combined = hstack([tfidf_features, sentiment_scores])
     y = df[target_column].values
 
-    # Step 2: Train/Test split
-    X_train_full, X_test, y_train_full, y_test = train_test_split(X, y, test_size=test_size, random_state=42)
-
-    # Step 3: Split train into train/validation for tuning
+    X_train_full, X_test, y_train_full, y_test = train_test_split(X_combined, y, test_size=test_size, random_state=42)
     X_train, X_val, y_train, y_val = train_test_split(X_train_full, y_train_full, test_size=0.25, random_state=42)
 
     def objective(trial):
         alpha = trial.suggest_float("alpha", 1e-4, 1.0, log=True)
         model = Lasso(alpha=alpha, max_iter=1000)
-        model.fit(X_train, y_train)
-
-        y_val_pred = model.predict(X_val)
-        y_test_pred = model.predict(X_test)
-
+        model.fit(X_train.toarray(), y_train)
+        y_val_pred = model.predict(X_val.toarray())
         mae_val = mean_absolute_error(y_val, y_val_pred)
-        mse_val = mean_squared_error(y_val, y_val_pred)
-        mae_test = mean_absolute_error(y_test, y_test_pred)
-        mse_test = mean_squared_error(y_test, y_test_pred)
+        return mae_val
 
-        trial.set_user_attr("MAE_val", mae_val)
-        trial.set_user_attr("MSE_test", mse_test)
-        trial.set_user_attr("MAE_test", mae_test)
-
-        return mse_val
-
-    # Step 4: Optimize
     study = optuna.create_study(direction='minimize')
     study.optimize(objective, n_trials=n_trials)
 
-    # Step 5: Final model training with best alpha
     best_alpha = study.best_params['alpha']
     final_model = Lasso(alpha=best_alpha, max_iter=1000)
-    final_model.fit(X_train_full, y_train_full)
-
-    # Step 6: Predict and return everything needed
-    y_pred = final_model.predict(X_test)
+    final_model.fit(X_train_full.toarray(), y_train_full)
+    y_pred = final_model.predict(X_test.toarray())
 
     print(" Best hyperparameters:", study.best_params)
-    print(" Best validation MSE:", study.best_trial.value)
-    print(" Best validation MAE:", study.best_trial.user_attrs["MAE_val"])
-    print(" Best test MSE:", study.best_trial.user_attrs["MSE_test"])
-    print(" Best test MAE:", study.best_trial.user_attrs["MAE_test"])
+    print(" Best validation MAE:", study.best_value)
+    print(" Test MSE:", mean_squared_error(y_test, y_pred))
+    print(" Test MAE:", mean_absolute_error(y_test, y_pred))
 
-    return final_model, tfidf_vectorizer, svd, X_test, y_test, y_pred
+    return final_model, tfidf_vectorizer, X_test, y_test, y_pred
