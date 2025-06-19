@@ -1,3 +1,4 @@
+import os
 import optuna
 from GMB import apply_lgb
 import matplotlib.pyplot as plt
@@ -7,10 +8,10 @@ import optuna.visualization as vis
 def objective(trial):
     num_leaves = trial.suggest_int('num_leaves', 20, 150)
     max_depth = trial.suggest_int('max_depth', -1, 10)
-    lr = trial.suggest_loguniform('lr', 1e-3, 1e-2)
+    lr = trial.suggest_loguniform('lr', 1e-2, 1e-1)
     n_estimators = trial.suggest_int('n_estimators', 100, 200)
 
-    mae_val, mse_val, mae_test, mse_test = apply_lgb(
+    mae_val, mse_val, mae_test, mse_test, _ = apply_lgb(
         num_leaves = num_leaves,
         max_depth = max_depth, 
         learning_rate = lr, 
@@ -24,7 +25,7 @@ def objective(trial):
     return mse_val
 
 study = optuna.create_study(direction='minimize')
-study.optimize(objective, n_trials=2)
+study.optimize(objective, n_trials=100)
 
 print("Best hyperparameters:")
 print(study.best_params)
@@ -37,3 +38,5 @@ print("Best test MAE:", best_trial.user_attrs["MAE_test"])
 
 vis.plot_optimization_history(study).show()
 vis.plot_param_importances(study).show()
+
+#os.system("rundll32.exe powrprof.dll,SetSuspendState 0,1,0")

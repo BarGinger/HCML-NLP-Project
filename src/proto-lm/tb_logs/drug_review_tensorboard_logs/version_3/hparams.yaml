@@ -1,0 +1,16 @@
+max_seq_length: 50
+num_prototypes: 200
+hidden_shape: 768
+num_classes: 2
+cohsep_ratio: 0.5
+lambda0: 0.5
+lambda1: 0.25
+lambda2: 0.25
+lr: 0.0003
+optim_eps: 1.0e-08
+betas:
+- 0.9
+- 0.999
+dist_eps: 1.0e-08
+analyze_mode: false
+proto_training_weights: true

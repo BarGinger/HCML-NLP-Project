@@ -1,5 +1,8 @@
 .Rhistory
 __pycache__
+*.ckpt
+*.pt
 .idea/
 *.iml
 /venv
+main
