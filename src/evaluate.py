@@ -1,4 +1,3 @@
-
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
@@ -11,15 +10,14 @@ import os
 import shap
 from tqdm import tqdm
 from scipy.special import expit  # sigmoid
-
-
+from sklearn.linear_model import Lasso
+import joblib
 
 # Global variable to hold the loaded model
 MODEL_DIR = "Models"
 EVAL_DIR = "Evaluation"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
-
 
 def load_lgb_model(filename=None):
     """
@@ -45,47 +43,21 @@ def load_lgb_model(filename=None):
 
     return lgb_model
 
-# def generate_saliency_map_lgb(booster, x_batch):
-#     """
-#     Generate saliency maps using SHAP TreeExplainer for LightGBM.
-
-#     Parameters:
-#     booster: The trained LightGBM Booster object.
-#     x_batch: Input features (e.g., X_test_combined).
-
-#     Returns:
-#     np.ndarray: SHAP values (feature attributions) for the input features.
-#     """
-#     # Ensure x_batch is a NumPy array
-#     if isinstance(x_batch, pd.DataFrame):
-#         x_batch = x_batch.values
-
-#     # Initialize SHAP TreeExplainer
-#     explainer = shap.TreeExplainer(booster)
-
-#     # Compute SHAP values
-#     shap_values = explainer.shap_values(x_batch)
-
-#     # Return SHAP values
-#     return np.array(shap_values)
-
-def generate_saliency_map_lgb(booster, x_batch):
+def load_lasso_model(filename=None):
     """
-    Generate saliency maps using SHAP TreeExplainer for LightGBM.
-    Returns: np.ndarray of shape (N, num_features)
+    Load a Lasso Regression model from a file (e.g., using joblib).
+
+    Parameters:
+    filename (str): The path to the model file.
+
+    Returns:
+    Lasso: The loaded Lasso Regression model.
     """
-    if isinstance(x_batch, pd.DataFrame):
-        x_batch = x_batch.values
-
-    explainer = shap.TreeExplainer(booster)
-    shap_values = explainer.shap_values(x_batch)
-
-    # If shap_values is a list (multi-output), select the correct index
-    if isinstance(shap_values, list):
-        shap_values = shap_values[0]
-
-    return shap_values  # Don't wrap again in np.array
-
+    import joblib  # Import joblib here to avoid it being a global requirement
+    if filename is None:
+        filename = f"{MODEL_DIR}/trained_lasso_model.joblib"  # Example filename
+    lasso_model = joblib.load(filename)
+    return lasso_model
 
 
 def calc_complexity(model, model_name, x_batch, y_batch, explanations_padded, device='cpu'):  
@@ -127,6 +99,46 @@ def calc_complexity(model, model_name, x_batch, y_batch, explanations_padded, de
     complexity_score = complexity_score[0]
     print(f"The model {model_name} got a Complexity Score of: {complexity_score:.4f}")
     return complexity_score
+
+class LassoWrapper(torch.nn.Module):
+    def __init__(self, model):
+        super(LassoWrapper, self).__init__()
+        self.model = model
+
+    def forward(self, x):
+        if isinstance(x, torch.Tensor):
+            x = x.detach().cpu().numpy()
+        predictions = self.model.predict(x)
+        predictions = np.expand_dims(predictions, axis=1)
+        return torch.tensor(predictions, dtype=torch.float32)
+
+    def predict(self, x):
+        if isinstance(x, torch.Tensor):
+            x = x.detach().cpu().numpy()
+        predictions = self.model.predict(x)
+        predictions = np.expand_dims(predictions, axis=1)
+        predictions = expit(predictions)  # maps to (0, 1)
+        return np.hstack([predictions, 1 - predictions])
+    
+
+    def generate_saliency_map(self, x_batch):
+        """
+        Generate saliency maps for Lasso Regression using model coefficients.
+
+        Parameters:
+        model: The trained Lasso Regression model.
+        x_batch: Input features.
+
+        Returns:
+        np.ndarray: Saliency maps (coefficients) for the input features.
+        """
+        if isinstance(x_batch, pd.DataFrame):
+            x_batch = x_batch.values
+
+        # The coefficients of the Lasso model serve as the feature importances
+        saliency_maps = self.model.coef_
+        return np.tile(saliency_maps, (x_batch.shape[0], 1))  # Repeat for each sample
+
 
 class LightGBMWrapper(torch.nn.Module):
     def __init__(self, booster):
@@ -205,7 +217,24 @@ class LightGBMWrapper(torch.nn.Module):
             return x.reshape(1, -1)  # Add batch dimension
         else:
             raise ValueError(f"Unexpected input shape: {shape}")
+        
+    
+    def generate_saliency_map(self, x_batch):
+        """
+        Generate saliency maps using SHAP TreeExplainer for LightGBM.
+        Returns: np.ndarray of shape (N, num_features)
+        """
+        if isinstance(x_batch, pd.DataFrame):
+            x_batch = x_batch.values
 
+        explainer = shap.TreeExplainer(self.booster)
+        shap_values = explainer.shap_values(x_batch)
+
+        # If shap_values is a list (multi-output), select the correct index
+        if isinstance(shap_values, list):
+            shap_values = shap_values[0]
+
+        return shap_values  # Don't wrap again in np.array
 
 def calculate_sparsity(a_batch, threshold=1e-5):
     """
@@ -301,7 +330,6 @@ class CustomFaithfulnessCorrelation:
         if self.return_aggregate:
             return correlation
         return correlation
-
 
 # Alternative implementation using the standard Quantus approach
 class TabularFaithfulnessCorrelation:
@@ -408,7 +436,6 @@ class TabularFaithfulnessCorrelation:
             return self.aggregate_func(correlations)
         return correlations
 
-
 def custom_perturb_func(x, indices, baseline=None, **kwargs):
     """
     Custom perturbation function for tabular data.
@@ -447,356 +474,363 @@ def explain_func(model, inputs, **kwargs):
     Returns:
     np.ndarray: Saliency maps for the input features.
     """
-    # Use the native LightGBM booster for SHAP explanations
-    if isinstance(model, LightGBMWrapper):
-        booster = model.booster
-    else:
-        booster = model
+    return model.generate_saliency_map(inputs)
 
-    return generate_saliency_map_lgb(booster, inputs)
+def calculate_sparsity_metric(model, model_name, x_batch, y_batch, explanations_padded):
+    """Calculate Sparsity metric."""
+    print("Calculating Sparsity Metric...")
+    sparsity_func  = quantus.Sparseness(
+        return_aggregate=True,
+        disable_warnings=False,
+        display_progressbar=True
+    )
+    sparsity_score = sparsity_func(
+        model=model,
+        x_batch=x_batch,
+        y_batch=y_batch,
+        a_batch=explanations_padded  # Saliency maps
+    )
 
+    if isinstance(sparsity_score, list):
+        sparsity_score = sparsity_score[0]
+    return sparsity_score
 
-def evaluate_lgb_model(model_filename, X_test_combined, y_test, metrics=None, use_subset=False):
-    """
-    Evaluate the LightGBM model using various metrics, save the results into csv in Evaluation folder.
-    Parameters:
-        model_filename (str): Path to the saved LightGBM model file.
-        X_test_combined (pd.DataFrame): Combined test features.
-        y_test (pd.Series): True labels for the test set.
-        metrics (list): List of metrics to calculate. If None, all metrics are calculated.
-        use_subset (bool): Whether to use a smaller subset of the data for evaluation.
-    """
+def calculate_robustness_metric(model, model_name, x_batch, y_batch, a_batch, booster):
+    """Calculate Robustness metric."""
+    print("Calculating Robustness Metric...")
+    metric_robustness = quantus.LocalLipschitzEstimate(
+        nr_samples=10,  # Number of samples to estimate the Lipschitz constant
+        perturb_std=0.4,  # Standard deviation of the Gaussian noise for perturbation
+        perturb_mean=0.0,  # Mean of the Gaussian noise for perturbation
+        norm_numerator=quantus.similarity_func.distance_euclidean,  # Function to compute the distance in the numerator
+        norm_denominator=quantus.similarity_func.distance_euclidean,  # Function to compute the distance in the denominator
+        perturb_func=quantus.perturb_func.gaussian_noise,  # Function to apply Gaussian noise for perturbation
+        similarity_func=quantus.similarity_func.lipschitz_constant,  # Function to compute the Lipschitz constant
+        disable_warnings=False,
+        display_progressbar=True
+    )        
 
-    # Initialize a list to store evaluation results
-    results = []
+    robustness_scores = metric_robustness(
+        model=model,  # The wrapped model to evaluate
+        x_batch=x_batch,  # Batch of input features
+        y_batch=y_batch,  # Batch of true labels
+        a_batch=a_batch,  # Batch of saliency maps
+        explain_func=lambda model, inputs, **kwargs: model.generate_saliency_map(inputs)  # Updated lambda function
+    )
+    # Aggregate the robustness scores (e.g., take the mean)
+    robustness_score_mean = np.mean(robustness_scores)
+    print(f"Robustness Score (mean): {robustness_score_mean}")
+    return robustness_score_mean
 
-    # Model name
-    model_name = "LightGBM"
+def calculate_faithfulness_correlation_metric(model, model_name, x_batch, y_batch, a_batch):
+    """Calculate Faithfulness Correlation metric."""
+    print("Calculating Faithfulness Correlation Metric...")
+    num_features = x_batch.shape[1]
+    subset_size = min(10, num_features)
     
-    # Load the LightGBM model
-    lgb_model = load_lgb_model(filename=model_filename)
-    booster = lgb_model._Booster  # Get the Booster object
-
-    # Use the loaded model for predictions
-    y_test_pred = booster.predict(X_test_combined)
-
-    # Generate saliency maps for the test dataset
-    print("Generating saliency maps...")
-    explanations_padded = generate_saliency_map_lgb(booster, X_test_combined)
-
-     # Wrap the LightGBM model
-    wrapped_model = LightGBMWrapper(booster)
-    wrapped_model.eval()
-
-    # Call calc_complexity for the test dataset
-    if "complexity" in metrics:
-        print("Calculating Complexity Metric...")
-        complexity_score = calc_complexity(
-            model=wrapped_model,  # Use the Booster's predict function
-            model_name="LightGBM",
-            x_batch=X_test_combined,
-            y_batch=y_test,
-            explanations_padded=explanations_padded,
+    # Use the corrected faithfulness implementation
+    faithfulness_metric = TabularFaithfulnessCorrelation(
+        subset_size=subset_size,
+        nr_runs=50,  # Reduced for faster computation, increase for more stable results
+        abs=True,
+        normalise=False,
+        aggregate_func=np.mean,
+        return_aggregate=True,
+        disable_warnings=False,
+        perturb_baseline="mean",
+        display_progressbar=True  # Enable progress bar
+    )
+    
+    try:
+        faithfulness_score = faithfulness_metric(
+            model=model,
+            x_batch=x_batch,
+            y_batch=y_batch,
+            a_batch=a_batch,
             device=device
         )
-        results.append({"model_name": model_name, "metric": "Complexity", "score": complexity_score})
+        
+        print(f"Faithfulness Correlation Score: {faithfulness_score:.4f}")
+        return faithfulness_score
+    
+    except Exception as e:
+        print(f"Error in FaithfulnessCorrelation metric: {e}")
+        return 0.0
 
+def calculate_localisation_metric(model, model_name, x_batch, y_batch, a_batch):
+    """Calculate Localisation metric."""
+    print("Calculating Localisation Metric...")
 
-    # Validate and reshape SHAP output if needed
-    if isinstance(explanations_padded, list):
-        explanations_padded = np.array(explanations_padded)
+    # Generate random segmentation masks (binary values: 0 or 1)
+    # Each mask will have the same number of features as the input
+    num_samples, num_features = x_batch.shape
+    s_batch = np.zeros((num_samples, 1), dtype=np.float32)  # One segment per input
 
-    # Convert to NumPy to avoid misinterpretation
-    # Ensure NumPy arrays and proper types
-    x_batch_np = np.array(X_test_combined.values, dtype=np.float32)  # Ensure it's float32 or float64
+    localisation_metric = quantus.RelevanceRankAccuracy(
+        abs=True,
+        normalise=False,
+        aggregate_func=np.mean,
+        return_aggregate=True,
+        disable_warnings=False,
+    )
+    localisation_score = localisation_metric(
+        model=model,
+        x_batch=x_batch,
+        y_batch=y_batch,
+        a_batch=a_batch,  # Saliency maps
+        s_batch=s_batch,  # Random segmentation masks
+        device=device
+    )
+    return localisation_score
+
+def calculate_monotonicity_metric(model, model_name, x_batch, y_batch, a_batch):
+    """Calculate Monotonicity Metric."""
+    print("Calculating Monotonicity Metric...")
+    y_batch_for_monotonicity = np.zeros_like(y_batch)  # Dummy labels for regression
+    
+    # Debugging: Print the shape of x_batch and y_batch
+    print(f"x_batch shape: {x_batch.shape}")
+    print(f"y_batch shape: {y_batch_for_monotonicity.shape}")
+    
+    monotonicity_metric = quantus.Monotonicity(
+        return_aggregate=True,
+        disable_warnings=False,
+        display_progressbar=True,
+        perturb_func=custom_perturb_func,
+        perturb_func_kwargs={
+            "x": x_batch,
+            "baseline": np.mean(x_batch, axis=0)
+        },  # Pass baseline as mean of input data
+    )
+
+     # Debugging: Check perturbed inputs
+    # Use SHAP values to identify important features
+    shap_values = np.abs(a_batch).mean(axis=0)  # Mean absolute SHAP values for each feature
+    num_top_features = min(15, shap_values.shape[0])  # Ensure we don't exceed the number of features
+    important_features = np.argsort(shap_values)[-num_top_features:]  # Top 10 important features
+    perturbed_inputs = monotonicity_metric.perturb_func(
+        arr=x_batch,
+        indices=important_features,
+        indexed_axes=[1]
+    )
+    print("Original Input (First Row):", x_batch[0])
+    print("Perturbed Input (First Row):", perturbed_inputs[0])
+
+    # Debugging: Check predictions for perturbed inputs
+    for i in range(5):  # Check the first 5 perturbed inputs
+        perturbed_input = perturbed_inputs[i]
+        original_prediction = model.predict(x_batch[i].reshape(1, -1))
+        perturbed_prediction = model.predict(perturbed_input.reshape(1, -1))
+        print(f"Original Prediction {i}: {original_prediction}")
+        print(f"Perturbed Prediction {i}: {perturbed_prediction}")
+
+    monotonicity_score = monotonicity_metric(
+        model=model,
+        x_batch=x_batch,
+        y_batch=y_batch_for_monotonicity,
+        a_batch=a_batch,  # Saliency maps
+        device=device
+    )
+    return monotonicity_score
+
+def calculate_randomisation_metric(model, model_name, x_batch, y_batch, a_batch):
+    """Calculate Randomisation Metric."""
+    print("Calculating Randomisation Metric...")
+    # Use the updated MPRT metric
+    randomisation_metric = quantus.MPRT(
+        # layer_order="independent",
+        similarity_func=quantus.similarity_func.correlation_pearson,  # Use a valid similarity function
+        return_average_correlation=True,  # Updated parameter
+        abs=True,
+        normalise=False,
+        aggregate_func=np.mean,
+        return_aggregate=True,
+        disable_warnings=False,
+    )
+
+    # Debugging: Check inputs
+    print(f"x_batch shape: {x_batch.shape}")
+    print(f"y_batch shape: {y_batch.shape}")
+    print(f"a_batch shape: {a_batch.shape}")
+
+    randomisation_score = randomisation_metric(
+        model=model,
+        x_batch=x_batch,
+        y_batch=y_batch,
+        a_batch=a_batch,  # Saliency maps
+        explain_func=explain_func,  # Explanation function
+        device=device
+    )
+    return randomisation_score
+
+def calculate_max_sensitivity_metric(model, model_name, x_batch, y_batch, a_batch):
+    """Calculate Max-Sensitivity Metric."""
+    print("Calculating Max-Sensitivity Metric...")
+    max_sensitivity_metric = quantus.MaxSensitivity(
+        nr_samples=10,  # Number of perturbation samples
+        perturb_func_kwargs={"lower_bound": -0.1, "upper_bound": 0.1},  # Define noise bounds
+        return_aggregate=True,
+        disable_warnings=False,
+        display_progressbar=True
+    )
+    max_sensitivity_score = max_sensitivity_metric(
+        model=model,
+        x_batch=x_batch,
+        y_batch=y_batch,
+        a_batch=a_batch,  # Saliency maps
+        explain_func=explain_func,  # Explanation function
+        device=device
+    )
+
+    if isinstance(max_sensitivity_score, list):
+        max_sensitivity_score = max_sensitivity_score[0]
+    return max_sensitivity_score
+
+def calculate_road_metric(model, model_name, x_batch, y_batch, a_batch):
+    """Calculate ROAD Metric."""
+    # Reshape saliency maps to add a third dimension
+    x_batch_reshaped = np.expand_dims(x_batch, axis=-1)  # Shape becomes (num_samples, num_features, 1)
+    a_batch_reshaped = np.expand_dims(a_batch, axis=-1)  # Shape becomes (num_samples, num_features, 1)
+
+    # ROAD Metric
+    print("Calculating ROAD Metric...")
+    # Normalize and reshape saliency maps
+    a_batch_normalized = (a_batch - np.min(a_batch)) / (np.max(a_batch) - np.min(a_batch))
+    a_batch_reshaped = np.expand_dims(a_batch_normalized, axis=-1)  # Shape becomes (num_samples, num_features, 1)
+    
+    print(f"x_batch_reshaped shape: {x_batch_reshaped.shape}")
+    print(f"a_batch_reshaped shape: {a_batch_reshaped.shape}")
+    
+    road_metric = quantus.ROAD(
+        return_aggregate=True,
+        perturb_func=custom_perturb_func,
+        perturb_func_kwargs={
+            # "x": x_batch_np,
+            "baseline": np.mean(x_batch, axis=0)
+        },  # Pass baseline as mean of input data
+        normalise=True,  # Normalize the scores
+        disable_warnings=False,
+        display_progressbar=True
+    )
+    road_score = road_metric(
+        model=model,
+        x_batch=x_batch_reshaped,
+        y_batch=y_batch,
+        a_batch=a_batch_reshaped,  # Reshaped saliency maps
+        explain_func=explain_func,  # Explanation function
+        device=device
+    )
+    return road_score
+
+def calculate_mae_metric(y_true, y_pred, model_name):
+    """Calculate Mean Absolute Error (MAE) metric."""
+    print("Calculating MAE...")
+    mae_score = mean_absolute_error(y_true, y_pred)
+    return mae_score
+
+def calculate_mse_metric(y_true, y_pred, model_name):
+    """Calculate Mean Squared Error (MSE) metric."""
+    print("Calculating MSE...")
+    mse_score = mean_squared_error(y_true, y_pred)
+    return mse_score
+
+def calculate_r2_metric(y_true, y_pred, model_name):
+    """Calculate R-squared metric."""
+    print("Calculating R-squared...")
+    r2 = r2_score(y_true, y_pred)
+    return r2
+
+def calculate_mape_metric(y_true, y_pred, model_name):
+    """Calculate Mean Absolute Percentage Error (MAPE) metric."""
+    print("Calculating MAPE...")
+    mape = mean_absolute_percentage_error(y_true, y_pred)
+    return mape
+
+def evaluate_model(model_type, model_filename, X_test_combined, y_test, metrics=None, use_subset=False):
+    """
+    Evaluate a given model (LGBM or Lasso) using various metrics.
+    """
+    results = []
+    model_name = model_type  # "LightGBM" or "Lasso"
+
+    if model_type == "LightGBM":
+        model = load_lgb_model(filename=model_filename)
+        booster = model._Booster
+        y_test_pred = booster.predict(X_test_combined)
+        wrapped_model = LightGBMWrapper(booster)
+        explanations_padded = wrapped_model.generate_saliency_map(X_test_combined)
+    elif model_type == "Lasso":
+        model = load_lasso_model(filename=model_filename)
+        y_test_pred = model.predict(X_test_combined)        
+        wrapped_model = LassoWrapper(model)
+        explanations_padded = wrapped_model.generate_saliency_map(X_test_combined)
+    else:
+        raise ValueError("Invalid model_type. Choose 'LightGBM' or 'Lasso'.")
+
+    wrapped_model.eval()
+
+    x_batch_np = np.array(X_test_combined.values, dtype=np.float32)
     a_batch_np = np.array(explanations_padded, dtype=np.float32)
-    y_batch_np = np.array(y_test.values, dtype=np.int32)  # or float32 depending on your task
+    y_batch_np = np.array(y_test.values, dtype=np.int32)
 
-
-    # Evaluate the robustness of the model using the Local Lipschitz Estimate metric
     if use_subset:
-        subset_size = min(10000, len(x_batch_np))  # Ensure we don't exceed the available data
+        subset_size = min(100, len(x_batch_np))
         subset_indices = np.random.choice(len(x_batch_np), size=subset_size, replace=False)
         x_batch_np_small = x_batch_np[subset_indices]
         y_batch_np_small = y_batch_np[subset_indices]
         a_batch_np_small = a_batch_np[subset_indices]
     else:
-        x_batch_np_small = x_batch_np 
-        y_batch_np_small = y_batch_np 
+        x_batch_np_small = x_batch_np
+        y_batch_np_small = y_batch_np
         a_batch_np_small = a_batch_np
-    
 
-    num_features = x_batch_np.shape[1]
-    subset_size = min(10, num_features - 1)  # Ensure it's strictly less
-    print(f"Subset size used: {subset_size}")
+    # Metric Calculations - using helper functions
+    if "complexity" in metrics:
+        complexity_score = calc_complexity(model=wrapped_model, model_name=model_name, x_batch=x_batch_np, y_batch=y_batch_np, explanations_padded=explanations_padded, device=device)
+        results.append({"model_name": model_name, "metric": "Complexity", "score": complexity_score})
 
-
-    # Sparsity Metric
     if "sparsity" in metrics:
-        print("Calculating Sparsity Metric...")
-        sparsity_func  = quantus.Sparseness(
-            return_aggregate=True,
-            disable_warnings=False,
-            display_progressbar=True
-        )
-        sparsity_score = sparsity_func(
-            model=wrapped_model,
-            x_batch=x_batch_np,
-            y_batch=y_batch_np,
-            a_batch=explanations_padded  # Saliency maps
-        )
-
-        if isinstance(sparsity_score, list):
-            sparsity_score = sparsity_score[0]
-
-        # sparsity_score = calculate_sparsity(a_batch_np, threshold=1e-5)
+        sparsity_score = calculate_sparsity_metric(model=wrapped_model, model_name=model_name, x_batch=x_batch_np, y_batch=y_batch_np, explanations_padded=explanations_padded)
         results.append({"model_name": model_name, "metric": "Sparsity", "score": sparsity_score})
 
-
-    if "robustness" in metrics:
-        # Robustness Metric
-        print("Calculating Robustness Metric...")
-        metric_robustness = quantus.LocalLipschitzEstimate(
-            nr_samples=10,  # Number of samples to estimate the Lipschitz constant
-            perturb_std=0.4,  # Standard deviation of the Gaussian noise for perturbation
-            perturb_mean=0.0,  # Mean of the Gaussian noise for perturbation
-            norm_numerator=quantus.similarity_func.distance_euclidean,  # Function to compute the distance in the numerator
-            norm_denominator=quantus.similarity_func.distance_euclidean,  # Function to compute the distance in the denominator
-            perturb_func=quantus.perturb_func.gaussian_noise,  # Function to apply Gaussian noise for perturbation
-            similarity_func=quantus.similarity_func.lipschitz_constant,  # Function to compute the Lipschitz constant
-            disable_warnings=False,
-            display_progressbar=True
-        )        
-
-        robustness_scores = metric_robustness(
-            model=wrapped_model,  # The wrapped model to evaluate
-            x_batch=x_batch_np_small,  # Batch of input features
-            y_batch=y_batch_np_small,  # Batch of true labels
-            a_batch=a_batch_np_small,  # Batch of saliency maps
-            explain_func=lambda model, inputs, **kwargs: generate_saliency_map_lgb(booster, inputs)  # Updated lambda function
-        )
-        # Aggregate the robustness scores (e.g., take the mean)
-        robustness_score_mean = np.mean(robustness_scores)
-        print(f"Robustness Score (mean): {robustness_score_mean}")
+    if "robustness" in metrics and model_type == "LightGBM": # Robustness only for LightGBM
+        robustness_score_mean = calculate_robustness_metric(model=wrapped_model, model_name=model_name, x_batch=x_batch_np_small, y_batch=y_batch_np_small, a_batch=a_batch_np_small, booster=booster)
         results.append({"model_name": model_name, "metric": "Robustness", "score": robustness_score_mean})
 
     if "faithfulness_correlation" in metrics:
-        print("Calculating Faithfulness Correlation Metric...")
-        
-        num_features = x_batch_np.shape[1]
-        subset_size = min(10, num_features)
-        
-        # Use the corrected faithfulness implementation
-        faithfulness_metric = TabularFaithfulnessCorrelation(
-            subset_size=subset_size,
-            nr_runs=50,  # Reduced for faster computation, increase for more stable results
-            abs=True,
-            normalise=False,
-            aggregate_func=np.mean,
-            return_aggregate=True,
-            disable_warnings=True,
-            perturb_baseline="mean",
-            display_progressbar=True  # Enable progress bar
-        )
-        
-        try:
-            faithfulness_score = faithfulness_metric(
-                model=wrapped_model,
-                x_batch=x_batch_np_small, #x_batch_np,
-                y_batch=y_batch_np_small, # y_batch_np,
-                a_batch=a_batch_np_small, #a_batch_np,
-                device=device
-            )
-            
-            print(f"Faithfulness Correlation Score: {faithfulness_score:.4f}")
-            results.append({"model_name": model_name, "metric": "Faithfulness", "score": faithfulness_score})
-        
-        except Exception as e:
-            print(f"Error in FaithfulnessCorrelation metric: {e}")
-            results.append({"model_name": model_name, "metric": "Faithfulness", "score": 0.0})
+        faithfulness_score = calculate_faithfulness_correlation_metric(model=wrapped_model, model_name=model_name, x_batch=x_batch_np_small, y_batch=y_batch_np_small, a_batch=a_batch_np_small)
+        results.append({"model_name": model_name, "metric": "Faithfulness", "score": faithfulness_score})
 
     if "localisation" in metrics:
-        print("Calculating Localisation Metric...")
-
-        # Generate random segmentation masks (binary values: 0 or 1)
-        # Each mask will have the same number of features as the input
-        num_samples, num_features = x_batch_np.shape
-        s_batch = np.zeros((num_samples, 1), dtype=np.float32)  # One segment per input
-
-
-        localisation_metric = quantus.RelevanceRankAccuracy(
-            abs=True,
-            normalise=False,
-            aggregate_func=np.mean,
-            return_aggregate=True,
-            disable_warnings=True,
-        )
-        localisation_score = localisation_metric(
-            model=wrapped_model,
-            x_batch=x_batch_np,
-            y_batch=y_batch_np,
-            a_batch=a_batch_np,  # Saliency maps
-            s_batch=s_batch,  # Random segmentation masks
-            device=device
-        )
+        localisation_score = calculate_localisation_metric(model=wrapped_model, model_name=model_name, x_batch=x_batch_np, y_batch=y_batch_np, a_batch=a_batch_np)
         results.append({"model_name": model_name, "metric": "Localisation", "score": localisation_score})
 
     if "monotonicity" in metrics:
-        print("Calculating Monotonicity Metric...")
-        y_batch_for_monotonicity = np.zeros_like(y_batch_np_small) # np.zeros_like(y_batch_np)  # Dummy labels for regression
-        
-        # Debugging: Print the shape of x_batch and y_batch
-        print(f"x_batch shape: {x_batch_np_small.shape}")
-        print(f"y_batch shape: {y_batch_for_monotonicity.shape}")
-        
-       
-        
-        monotonicity_metric = quantus.Monotonicity(
-            return_aggregate=True,
-            disable_warnings=False,
-            display_progressbar=True,
-            perturb_func=custom_perturb_func,
-            perturb_func_kwargs={
-                "x": x_batch_np_small,
-                "baseline": np.mean(x_batch_np, axis=0)
-            },  # Pass baseline as mean of input data
-        )
-
-         # Debugging: Check perturbed inputs
-        # Use SHAP values to identify important features
-        shap_values = np.abs(a_batch_np_small).mean(axis=0)  # Mean absolute SHAP values for each feature
-        num_top_features = min(15, shap_values.shape[0])  # Ensure we don't exceed the number of features
-        important_features = np.argsort(shap_values)[-num_top_features:]  # Top 10 important features
-        perturbed_inputs = monotonicity_metric.perturb_func(
-            arr=x_batch_np_small,
-            indices=important_features,
-            indexed_axes=[1]
-        )
-        print("Original Input (First Row):", x_batch_np_small[0])
-        print("Perturbed Input (First Row):", perturbed_inputs[0])
-
-        # Debugging: Check predictions for perturbed inputs
-        for i in range(5):  # Check the first 5 perturbed inputs
-            perturbed_input = perturbed_inputs[i]
-            original_prediction = wrapped_model.predict(x_batch_np_small[i].reshape(1, -1))
-            perturbed_prediction = wrapped_model.predict(perturbed_input.reshape(1, -1))
-            print(f"Original Prediction {i}: {original_prediction}")
-            print(f"Perturbed Prediction {i}: {perturbed_prediction}")
-
-        monotonicity_score = monotonicity_metric(
-            model=wrapped_model,
-            x_batch=x_batch_np_small,# x_batch_np,
-            y_batch=y_batch_for_monotonicity,
-            a_batch=a_batch_np_small,#a_batch_np,  # Saliency maps
-            device=device
-        )
+        monotonicity_score = calculate_monotonicity_metric(model=wrapped_model, model_name=model_name, x_batch=x_batch_np_small, y_batch=y_batch_np_small, a_batch=a_batch_np_small)
         results.append({"model_name": model_name, "metric": "Monotonicity", "score": monotonicity_score})
-    
+
     if "randomisation" in metrics:
-        print("Calculating Randomisation Metric...")
-        # Use the updated MPRT metric
-        randomisation_metric = quantus.MPRT(
-            # layer_order="independent",
-            similarity_func=quantus.similarity_func.correlation_pearson,  # Use a valid similarity function
-            return_average_correlation=True,  # Updated parameter
-            abs=True,
-            normalise=False,
-            aggregate_func=np.mean,
-            return_aggregate=True,
-            disable_warnings=True,
-        )
-
-        # Debugging: Check inputs
-        print(f"x_batch_np shape: {x_batch_np.shape}")
-        print(f"y_batch_np shape: {y_batch_np.shape}")
-        print(f"a_batch_np shape: {a_batch_np.shape}")
-
-        randomisation_score = randomisation_metric(
-            model=wrapped_model,
-            x_batch=x_batch_np,
-            y_batch=y_batch_np,
-            a_batch=a_batch_np,  # Saliency maps
-            explain_func=explain_func,  # Explanation function
-            device=device
-        )
+        randomisation_score = calculate_randomisation_metric(model=wrapped_model, model_name=model_name, x_batch=x_batch_np, y_batch=y_batch_np, a_batch=a_batch_np)
         results.append({"model_name": model_name, "metric": "Randomisation", "score": randomisation_score})
 
     if "max_sensitivity" in metrics:
-        print("Calculating Max-Sensitivity Metric...")
-        max_sensitivity_metric = quantus.MaxSensitivity(
-            nr_samples=10,  # Number of perturbation samples
-            perturb_func_kwargs={"lower_bound": -0.1, "upper_bound": 0.1},  # Define noise bounds
-            return_aggregate=True,
-            disable_warnings=False,
-            display_progressbar=True
-        )
-        max_sensitivity_score = max_sensitivity_metric(
-            model=wrapped_model,
-            x_batch=x_batch_np_small,#x_batch_np,
-            y_batch=y_batch_np_small, #y_batch_np,
-            a_batch=a_batch_np_small, # a_batch_np,  # Saliency maps
-            explain_func=explain_func,  # Explanation function
-            device=device
-        )
-
-        if isinstance(max_sensitivity_score, list):
-            max_sensitivity_score = max_sensitivity_score[0]
+        max_sensitivity_score = calculate_max_sensitivity_metric(model=wrapped_model, model_name=model_name, x_batch=x_batch_np_small, y_batch=y_batch_np_small, a_batch=a_batch_np_small)
         results.append({"model_name": model_name, "metric": "Max-Sensitivity", "score": max_sensitivity_score})
-    
-    
-    if "road" in metrics:
-        # Reshape saliency maps to add a third dimension
-        x_batch_np_reshaped = np.expand_dims(x_batch_np, axis=-1)  # Shape becomes (num_samples, num_features, 1)
-        a_batch_np_reshaped = np.expand_dims(a_batch_np, axis=-1)  # Shape becomes (num_samples, num_features, 1)
 
-        # ROAD Metric
-        print("Calculating ROAD Metric...")
-        # Normalize and reshape saliency maps
-        a_batch_np_normalized = (a_batch_np - np.min(a_batch_np)) / (np.max(a_batch_np) - np.min(a_batch_np))
-        a_batch_np_reshaped = np.expand_dims(a_batch_np_normalized, axis=-1)  # Shape becomes (num_samples, num_features, 1)
-        
-        print(f"x_batch_np_reshaped shape: {x_batch_np_reshaped.shape}")
-        print(f"a_batch_np_reshaped shape: {a_batch_np_reshaped.shape}")
-        
-        road_metric = quantus.ROAD(
-            return_aggregate=True,
-            perturb_func=custom_perturb_func,
-            perturb_func_kwargs={
-                # "x": x_batch_np,
-                "baseline": np.mean(x_batch_np, axis=0)
-            },  # Pass baseline as mean of input data
-            normalise=True,  # Normalize the scores
-            disable_warnings=False,
-            display_progressbar=True
-        )
-        road_score = road_metric(
-            model=wrapped_model,
-            x_batch=x_batch_np_reshaped,
-            y_batch=y_batch_np,
-            a_batch=a_batch_np_reshaped,  # Reshaped saliency maps
-            explain_func=explain_func,  # Explanation function
-            device=device
-        )
+    if "road" in metrics:
+        road_score = calculate_road_metric(model=wrapped_model, model_name=model_name, x_batch=x_batch_np, y_batch=y_batch_np, a_batch=a_batch_np)
         results.append({"model_name": model_name, "metric": "ROAD", "score": road_score})
 
-    # Mean Absolute Error (MAE)
-    print("Calculating MAE...")
-    mae_score = mean_absolute_error(y_test, y_test_pred)
+    mae_score = calculate_mae_metric(y_test, y_test_pred, model_name)
     results.append({"model_name": model_name, "metric": "MAE", "score": mae_score})
 
-    # Mean Squared Error (MSE)
-    print("Calculating MSE...")
-    mse_score = mean_squared_error(y_test, y_test_pred)
+    mse_score = calculate_mse_metric(y_test, y_test_pred, model_name)
     results.append({"model_name": model_name, "metric": "MSE", "score": mse_score})
 
-    # R-squared
-    print("Calculating R-squared...")
-    r2 = r2_score(y_test, y_test_pred)
+    r2 = calculate_r2_metric(y_test, y_test_pred, model_name)
     results.append({"model_name": model_name, "metric": "R-squared", "score": r2})
 
-    # Mean Absolute Percentage Error (MAPE)
-    print("Calculating MAPE...")
-    mape = mean_absolute_percentage_error(y_test, y_test_pred)
+    mape = calculate_mape_metric(y_test, y_test_pred, model_name)
     results.append({"model_name": model_name, "metric": "MAPE", "score": mape})
 
     # Convert results to a DataFrame
@@ -811,28 +845,29 @@ def evaluate_lgb_model(model_filename, X_test_combined, y_test, metrics=None, us
     results_df.to_csv(output_csv, index=False)
     print(f"Evaluation scores saved to {output_csv}")
 
+# Update main
 if __name__ == '__main__':
-     # load the data
     print("Loading data...")
-    X_train_combined, y_train, X_val_combined, y_val, X_test_combined, y_test, tfidf_vectorizer, svd = load_data()   
-    
-    metrics = [
-                "complexity", # checked
-                "sparsity", # checked
-                "max_sensitivity", # checked
-                "robustness", # checked
-                "faithfulness_correlation", # checked
-                # "monotonicity", # no working                
-                # "localisation", # not working
-                # "randomisation", # not working
-                # "road" # not working
-    ]  # Specify the metrics you want to calculate
-    # metrics = ["localisation"]
-    # Evaluate the LightGBM model
+    X_train_combined, y_train, X_val_combined, y_val, X_test_combined, y_test, tfidf_vectorizer, svd = load_data()
 
+    metrics = [
+        "complexity",
+        "sparsity",
+        "max_sensitivity",
+        "robustness",
+        "faithfulness_correlation",
+        # "monotonicity",
+        # "localisation",
+        # "randomisation",
+        # "road"
+    ]
+
+    # Evaluate LightGBM model
     print("Evaluating LightGBM model...")
-    # Change this filename to the path where your model is saved
-    lgb_model_filename = f"{MODEL_DIR}/trained_lgb_model_20250617_145741.txt"  # Path to the saved LightGBM model
-    # if this takes too long change use_subset=True to use a smaller subset of the data for evaluation
-    evaluate_lgb_model(lgb_model_filename, X_test_combined, y_test, metrics=metrics, use_subset=True) 
-    
+    lgb_model_filename = f"{MODEL_DIR}/trained_lgb_model_20250617_145741.txt"
+    evaluate_model("LightGBM", lgb_model_filename, X_test_combined, y_test, metrics=metrics, use_subset=True)
+
+    # Evaluate Lasso model
+    print("Evaluating Lasso model...")
+    lasso_model_filename = f"{MODEL_DIR}/trained_lasso_model.joblib"
+    evaluate_model("Lasso", lasso_model_filename, X_test_combined, y_test, metrics=metrics, use_subset=True)
