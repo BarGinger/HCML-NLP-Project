@@ -1,6 +1,6 @@
-from src.data_loader import load_all_data
-from src.preprocess import preprocess_dataframe
-from src.config import TEXT_COLUMN
+from data_loader import load_all_data
+from preprocess import preprocess_dataframe
+from config import TEXT_COLUMN
 
 
 def main():
