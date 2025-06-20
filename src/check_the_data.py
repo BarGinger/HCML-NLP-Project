@@ -6,6 +6,7 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from sklearn.model_selection import train_test_split
 import optuna
+from scipy.sparse import hstack
 
 def feature_extraction(df, tfidf_vectorizer=None, fit=False):
     df = df.copy()
@@ -13,7 +14,7 @@ def feature_extraction(df, tfidf_vectorizer=None, fit=False):
     df[text_column] = df[text_column].fillna("")
 
     if fit:
-        tfidf_vectorizer = TfidfVectorizer(max_features=10000)
+        tfidf_vectorizer = TfidfVectorizer(max_features=20)
         tfidf_features = tfidf_vectorizer.fit_transform(df[text_column])
     else:
         tfidf_features = tfidf_vectorizer.transform(df[text_column])
@@ -105,8 +106,7 @@ def print_top_features_by_absolute_weight(lasso_model, svd_model, tfidf_vectoriz
     for idx in top_word_indices:
         print(f"{terms[idx]}: {word_scores[idx]:.4f}")
 
-def print_most_important_features(lasso_model, tfidf_vectorizer, top_n=20):
-    feature_names = list(tfidf_vectorizer.get_feature_names_out()) + ['sentiment_score']
+def print_most_important_features(lasso_model, feature_names, top_n=20):
     coefs = lasso_model.coef_
 
     print(f"Total number of features (including sentiment score): {len(feature_names)}\n")
@@ -120,8 +120,6 @@ def print_most_important_features(lasso_model, tfidf_vectorizer, top_n=20):
     for _, row in coef_df.head(top_n).iterrows():
         sign = '+' if row['coefficient'] > 0 else '-'
         print(f"{row['feature']}: {sign}{abs(row['coefficient']):.4f}")
-
-
 
 
 def evaluate_lasso_model(y_test, y_pred):
@@ -138,20 +136,21 @@ def analyze_lasso_coefficients(lasso_model, tfidf_vectorizer):
     print("\nTop negative coefficients:")
     print(coef_df.tail(20))
 
-def run_lasso_with_optuna(df, target_column='rating', test_size=0.2, n_trials=30):
-    tfidf_features, sentiment_scores, tfidf_vectorizer = feature_extraction(df, fit=True)
-    from scipy.sparse import hstack
-    X_combined = hstack([tfidf_features, sentiment_scores])
-    y = df[target_column].values
+def run_lasso_with_optuna(X_train, y_train, X_val, y_val, X_test, y_test, tfidf_vectorizer, svd,
+                           target_column='rating', test_size=0.2, n_trials=30):
+    
+    # tfidf_features, sentiment_scores, tfidf_vectorizer = feature_extraction(df, fit=True)
+    # X_combined = hstack([tfidf_features, sentiment_scores])
+    # y = df[target_column].values
 
-    X_train_full, X_test, y_train_full, y_test = train_test_split(X_combined, y, test_size=test_size, random_state=42)
-    X_train, X_val, y_train, y_val = train_test_split(X_train_full, y_train_full, test_size=0.25, random_state=42)
+    # X_train_full, X_test, y_train_full, y_test = train_test_split(X_combined, y, test_size=test_size, random_state=42)
+    # X_train, X_val, y_train, y_val = train_test_split(X_train_full, y_train_full, test_size=0.25, random_state=42)
 
     def objective(trial):
         alpha = trial.suggest_float("alpha", 1e-4, 1.0, log=True)
         model = Lasso(alpha=alpha, max_iter=1000)
-        model.fit(X_train.toarray(), y_train)
-        y_val_pred = model.predict(X_val.toarray())
+        model.fit(X_train, y_train)
+        y_val_pred = model.predict(X_val)
         mae_val = mean_absolute_error(y_val, y_val_pred)
         return mae_val
 
@@ -160,12 +159,12 @@ def run_lasso_with_optuna(df, target_column='rating', test_size=0.2, n_trials=30
 
     best_alpha = study.best_params['alpha']
     final_model = Lasso(alpha=best_alpha, max_iter=1000)
-    final_model.fit(X_train_full.toarray(), y_train_full)
-    y_pred = final_model.predict(X_test.toarray())
+    final_model.fit(X_train, y_train)
+    y_pred = final_model.predict(X_test)
 
     print(" Best hyperparameters:", study.best_params)
     print(" Best validation MAE:", study.best_value)
     print(" Test MSE:", mean_squared_error(y_test, y_pred))
     print(" Test MAE:", mean_absolute_error(y_test, y_pred))
 
-    return final_model, tfidf_vectorizer, X_test, y_test, y_pred
+    return final_model, y_pred

@@ -12,6 +12,8 @@ from tqdm import tqdm
 from scipy.special import expit  # sigmoid
 from sklearn.linear_model import Lasso
 import joblib
+from check_the_data import feature_extraction # Import the function
+from scipy.sparse import hstack
 
 # Global variable to hold the loaded model
 MODEL_DIR = "Models"
@@ -774,7 +776,7 @@ def evaluate_model(model_type, model_filename, X_test_combined, y_test, metrics=
     y_batch_np = np.array(y_test.values, dtype=np.int32)
 
     if use_subset:
-        subset_size = min(100, len(x_batch_np))
+        subset_size = min(10000, len(x_batch_np))
         subset_indices = np.random.choice(len(x_batch_np), size=subset_size, replace=False)
         x_batch_np_small = x_batch_np[subset_indices]
         y_batch_np_small = y_batch_np[subset_indices]
@@ -848,6 +850,15 @@ def evaluate_model(model_type, model_filename, X_test_combined, y_test, metrics=
 # Update main
 if __name__ == '__main__':
     print("Loading data...")
+
+    # # Load the TF-IDF vectorizer used during training    
+    # tfidf_features, sentiment_scores, tfidf_vectorizer = feature_extraction(pd.DataFrame({'review_clean':X_test_combined['review_clean']}), fit=True)
+
+    # # Transform the test data using the loaded vectorizer
+    # X_test_tfidf = tfidf_vectorizer.transform(X_test_combined['review_clean'])
+
+    # # Combine TF-IDF and sentiment features    
+    # X_test_combined = hstack([X_test_tfidf, sentiment_scores])
     X_train_combined, y_train, X_val_combined, y_val, X_test_combined, y_test, tfidf_vectorizer, svd = load_data()
 
     metrics = [
@@ -864,10 +875,10 @@ if __name__ == '__main__':
 
     # Evaluate LightGBM model
     print("Evaluating LightGBM model...")
-    lgb_model_filename = f"{MODEL_DIR}/trained_lgb_model_20250617_145741.txt"
+    lgb_model_filename = f"{MODEL_DIR}/trained_lgb_model_20250619_214423.txt"
     evaluate_model("LightGBM", lgb_model_filename, X_test_combined, y_test, metrics=metrics, use_subset=True)
 
     # Evaluate Lasso model
     print("Evaluating Lasso model...")
-    lasso_model_filename = f"{MODEL_DIR}/trained_lasso_model.joblib"
+    lasso_model_filename = f"{MODEL_DIR}/trained_lasso_model_20250619_213910.joblib"
     evaluate_model("Lasso", lasso_model_filename, X_test_combined, y_test, metrics=metrics, use_subset=True)
