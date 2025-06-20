@@ -1,0 +1,9 @@
+model_name,metric,score
+Lasso,Complexity,0.0
+Lasso,Sparsity,0.9696937697075293
+Lasso,Faithfulness,1.0
+Lasso,Max-Sensitivity,2.3433950707036176e-08
+Lasso,MAE,2.686099316101783
+Lasso,MSE,9.853884113831414
+Lasso,R-squared,0.07106780912688293
+Lasso,MAPE,1.0903773643961487
