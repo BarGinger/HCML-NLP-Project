@@ -1,0 +1,21 @@
+{
+    "boosting_type": "gbdt",
+    "class_weight": null,
+    "colsample_bytree": 0.6402862042186985,
+    "importance_type": "split",
+    "learning_rate": 0.09295622849894335,
+    "max_depth": 8,
+    "min_child_samples": 21,
+    "min_child_weight": 0.001,
+    "min_split_gain": 0.0,
+    "n_estimators": 233,
+    "n_jobs": null,
+    "num_leaves": 47,
+    "objective": null,
+    "random_state": 42,
+    "reg_alpha": 0.438709163656269,
+    "reg_lambda": 0.46508479177255,
+    "subsample": 0.6588372936464622,
+    "subsample_for_bin": 200000,
+    "subsample_freq": 0
+}

@@ -1,12 +1,13 @@
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, mean_absolute_percentage_error
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, mean_absolute_percentage_error, cohen_kappa_score
 from lightgbm import LGBMRegressor
-from GMB import load_data   
+from feature_extraction import load_data   
 import quantus
 import torch
 import os
+import json
 import shap
 from tqdm import tqdm
 from scipy.special import expit  # sigmoid
@@ -103,13 +104,20 @@ def calc_complexity(model, model_name, x_batch, y_batch, explanations_padded, de
     return complexity_score
 
 class LassoWrapper(torch.nn.Module):
-    def __init__(self, model):
+    def __init__(self, model, feature_names=None):
         super(LassoWrapper, self).__init__()
         self.model = model
+        self.feature_names = feature_names  # Save feature names
 
     def forward(self, x):
+        # Convert torch.Tensor to np.ndarray if needed
         if isinstance(x, torch.Tensor):
             x = x.detach().cpu().numpy()
+        if isinstance(x, np.ndarray):
+            if self.feature_names is not None:
+                if x.ndim == 1:
+                    x = x.reshape(1, -1)
+                x = pd.DataFrame(x, columns=self.feature_names)
         predictions = self.model.predict(x)
         predictions = np.expand_dims(predictions, axis=1)
         return torch.tensor(predictions, dtype=torch.float32)
@@ -117,6 +125,11 @@ class LassoWrapper(torch.nn.Module):
     def predict(self, x):
         if isinstance(x, torch.Tensor):
             x = x.detach().cpu().numpy()
+        if isinstance(x, np.ndarray):
+            if self.feature_names is not None:
+                if x.ndim == 1:
+                    x = x.reshape(1, -1)
+                x = pd.DataFrame(x, columns=self.feature_names)
         predictions = self.model.predict(x)
         predictions = np.expand_dims(predictions, axis=1)
         predictions = expit(predictions)  # maps to (0, 1)
@@ -497,7 +510,7 @@ def calculate_sparsity_metric(model, model_name, x_batch, y_batch, explanations_
         sparsity_score = sparsity_score[0]
     return sparsity_score
 
-def calculate_robustness_metric(model, model_name, x_batch, y_batch, a_batch, booster):
+def calculate_robustness_metric(model, x_batch, y_batch, a_batch):
     """Calculate Robustness metric."""
     print("Calculating Robustness Metric...")
     metric_robustness = quantus.LocalLipschitzEstimate(
@@ -524,7 +537,7 @@ def calculate_robustness_metric(model, model_name, x_batch, y_batch, a_batch, bo
     print(f"Robustness Score (mean): {robustness_score_mean}")
     return robustness_score_mean
 
-def calculate_faithfulness_correlation_metric(model, model_name, x_batch, y_batch, a_batch):
+def calculate_faithfulness_correlation_metric(model, x_batch, y_batch, a_batch):
     """Calculate Faithfulness Correlation metric."""
     print("Calculating Faithfulness Correlation Metric...")
     num_features = x_batch.shape[1]
@@ -742,6 +755,23 @@ def calculate_r2_metric(y_true, y_pred, model_name):
     r2 = r2_score(y_true, y_pred)
     return r2
 
+def calculate_kappa_metric(y_true, y_pred, model_name):
+    """Calculate Cohen's Kappa metric."""
+    print("Calculating Cohen's Kappa...")
+    # Ensure y_true and y_pred are 1D arrays
+    if isinstance(y_true, pd.Series):
+        y_true = y_true.values
+    if isinstance(y_pred, pd.Series):
+        y_pred = y_pred.values
+
+
+    y_pred = np.array(y_pred, dtype=np.int32)  # Ensure predictions are integers
+    y_true = np.array(y_true, dtype=np.int32)  # Ensure true labels are integers
+
+    # Calculate Cohen's Kappa
+    kappa = cohen_kappa_score(y_true, y_pred)
+    return kappa
+
 def calculate_mape_metric(y_true, y_pred, model_name):
     """Calculate Mean Absolute Percentage Error (MAPE) metric."""
     print("Calculating MAPE...")
@@ -755,16 +785,16 @@ def evaluate_model(model_type, model_filename, X_test_combined, y_test, metrics=
     results = []
     model_name = model_type  # "LightGBM" or "Lasso"
 
-    if model_type == "LightGBM":
+    if "LightGBM" in model_type:
         model = load_lgb_model(filename=model_filename)
         booster = model._Booster
         y_test_pred = booster.predict(X_test_combined)
         wrapped_model = LightGBMWrapper(booster)
         explanations_padded = wrapped_model.generate_saliency_map(X_test_combined)
-    elif model_type == "Lasso":
+    elif "Lasso" in model_type:
         model = load_lasso_model(filename=model_filename)
         y_test_pred = model.predict(X_test_combined)        
-        wrapped_model = LassoWrapper(model)
+        wrapped_model = LassoWrapper(model, feature_names=X_test_combined.columns)
         explanations_padded = wrapped_model.generate_saliency_map(X_test_combined)
     else:
         raise ValueError("Invalid model_type. Choose 'LightGBM' or 'Lasso'.")
@@ -793,54 +823,70 @@ def evaluate_model(model_type, model_filename, X_test_combined, y_test, metrics=
 
     if "sparsity" in metrics:
         sparsity_score = calculate_sparsity_metric(model=wrapped_model, model_name=model_name, x_batch=x_batch_np, y_batch=y_batch_np, explanations_padded=explanations_padded)
+        print(f"Sparsity Score: {sparsity_score}")
         results.append({"model_name": model_name, "metric": "Sparsity", "score": sparsity_score})
 
-    if "robustness" in metrics and model_type == "LightGBM": # Robustness only for LightGBM
-        robustness_score_mean = calculate_robustness_metric(model=wrapped_model, model_name=model_name, x_batch=x_batch_np_small, y_batch=y_batch_np_small, a_batch=a_batch_np_small, booster=booster)
+    if "robustness" in metrics: # Robustness only for LightGBM
+        robustness_score_mean = calculate_robustness_metric(model=wrapped_model, x_batch=x_batch_np_small, y_batch=y_batch_np_small, a_batch=a_batch_np_small)
         results.append({"model_name": model_name, "metric": "Robustness", "score": robustness_score_mean})
 
     if "faithfulness_correlation" in metrics:
-        faithfulness_score = calculate_faithfulness_correlation_metric(model=wrapped_model, model_name=model_name, x_batch=x_batch_np_small, y_batch=y_batch_np_small, a_batch=a_batch_np_small)
+        faithfulness_score = calculate_faithfulness_correlation_metric(model=wrapped_model, x_batch=x_batch_np_small, y_batch=y_batch_np_small, a_batch=a_batch_np_small)
+        print(f"Faithfulness Correlation Score: {faithfulness_score:.4f}")
         results.append({"model_name": model_name, "metric": "Faithfulness", "score": faithfulness_score})
 
     if "localisation" in metrics:
         localisation_score = calculate_localisation_metric(model=wrapped_model, model_name=model_name, x_batch=x_batch_np, y_batch=y_batch_np, a_batch=a_batch_np)
+        print(f"Localisation Score: {localisation_score:.4f}")
         results.append({"model_name": model_name, "metric": "Localisation", "score": localisation_score})
 
     if "monotonicity" in metrics:
         monotonicity_score = calculate_monotonicity_metric(model=wrapped_model, model_name=model_name, x_batch=x_batch_np_small, y_batch=y_batch_np_small, a_batch=a_batch_np_small)
+        print(f"Monotonicity Score: {monotonicity_score:.4f}")
         results.append({"model_name": model_name, "metric": "Monotonicity", "score": monotonicity_score})
 
     if "randomisation" in metrics:
         randomisation_score = calculate_randomisation_metric(model=wrapped_model, model_name=model_name, x_batch=x_batch_np, y_batch=y_batch_np, a_batch=a_batch_np)
+        print(f"Randomisation Score: {randomisation_score:.4f}")
         results.append({"model_name": model_name, "metric": "Randomisation", "score": randomisation_score})
 
     if "max_sensitivity" in metrics:
         max_sensitivity_score = calculate_max_sensitivity_metric(model=wrapped_model, model_name=model_name, x_batch=x_batch_np_small, y_batch=y_batch_np_small, a_batch=a_batch_np_small)
+        print(f"Max-Sensitivity Score: {max_sensitivity_score:.4f}")
         results.append({"model_name": model_name, "metric": "Max-Sensitivity", "score": max_sensitivity_score})
 
     if "road" in metrics:
         road_score = calculate_road_metric(model=wrapped_model, model_name=model_name, x_batch=x_batch_np, y_batch=y_batch_np, a_batch=a_batch_np)
+        print(f"ROAD Score: {road_score:.4f}")
         results.append({"model_name": model_name, "metric": "ROAD", "score": road_score})
 
     mae_score = calculate_mae_metric(y_test, y_test_pred, model_name)
+    print(f"MAE Score: {mae_score:.4f}")
     results.append({"model_name": model_name, "metric": "MAE", "score": mae_score})
 
     mse_score = calculate_mse_metric(y_test, y_test_pred, model_name)
+    print(f"MSE Score: {mse_score:.4f}")
     results.append({"model_name": model_name, "metric": "MSE", "score": mse_score})
 
     r2 = calculate_r2_metric(y_test, y_test_pred, model_name)
+    print(f"R-squared Score: {r2:.4f}")
     results.append({"model_name": model_name, "metric": "R-squared", "score": r2})
 
     mape = calculate_mape_metric(y_test, y_test_pred, model_name)
+    print(f"MAPE Score: {mape:.4f}")
     results.append({"model_name": model_name, "metric": "MAPE", "score": mape})
+
+
+    kappa = calculate_kappa_metric(y_test, y_test_pred, model_name)
+    print(f"Cohen's Kappa Score: {kappa:.4f}")   
+    results.append({"model_name": model_name, "metric": "Cohen's Kappa", "score": kappa})
 
     # Convert results to a DataFrame
     results_df = pd.DataFrame(results)
 
     # Ensure the output directory exists
-    timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
-    output_csv = f"{EVAL_DIR}/{model_name}_evaluation_scores_{timestamp}.csv"
+    file_name = model_filename.split("/")[-1].split(".")[0]
+    output_csv = f"{EVAL_DIR}/{file_name}_evaluation_scores.csv"
     os.makedirs(os.path.dirname(output_csv), exist_ok=True)
 
     # Export results to CSV
@@ -851,15 +897,23 @@ def evaluate_model(model_type, model_filename, X_test_combined, y_test, metrics=
 if __name__ == '__main__':
     print("Loading data...")
 
-    # # Load the TF-IDF vectorizer used during training    
-    # tfidf_features, sentiment_scores, tfidf_vectorizer = feature_extraction(pd.DataFrame({'review_clean':X_test_combined['review_clean']}), fit=True)
-
-    # # Transform the test data using the loaded vectorizer
-    # X_test_tfidf = tfidf_vectorizer.transform(X_test_combined['review_clean'])
-
-    # # Combine TF-IDF and sentiment features    
-    # X_test_combined = hstack([X_test_tfidf, sentiment_scores])
     X_train_combined, y_train, X_val_combined, y_val, X_test_combined, y_test, tfidf_vectorizer, svd = load_data()
+
+    X_train_features = X_train_combined.drop(columns=['patient_id'])
+    X_val_features = X_val_combined.drop(columns=['patient_id'])
+    X_test_features = X_test_combined.drop(columns=['patient_id'])
+
+    # load top features from JSON file for LightGBM
+    with open(f"{MODEL_DIR}/top_15_features.json", "r") as f:
+        lgb_top_features = json.load(f)
+
+    X_test_lgb_top = X_test_features[lgb_top_features]
+
+    # load top features from JSON file for Lasso
+    with open(f"{MODEL_DIR}/lasso_model_top_15_features_20250621_223226.json", "r") as f:
+        lasso_top_features = json.load(f)
+
+    X_test_lasso_top = X_test_features[lasso_top_features]
 
     metrics = [
         "complexity",
@@ -867,18 +921,41 @@ if __name__ == '__main__':
         "max_sensitivity",
         "robustness",
         "faithfulness_correlation",
+
         # "monotonicity",
         # "localisation",
         # "randomisation",
         # "road"
     ]
 
-    # Evaluate LightGBM model
-    print("Evaluating LightGBM model...")
-    lgb_model_filename = f"{MODEL_DIR}/trained_lgb_model_20250619_214423.txt"
-    evaluate_model("LightGBM", lgb_model_filename, X_test_combined, y_test, metrics=metrics, use_subset=True)
+    models = [
+        # "LightGBMTop15",
+        # "LightGBMFull",        
+        "LassoFull",
+        "LassoTop15"
+    ]
+    print("Starting evaluation...")
 
-    # Evaluate Lasso model
-    print("Evaluating Lasso model...")
-    lasso_model_filename = f"{MODEL_DIR}/trained_lasso_model_20250619_213910.joblib"
-    evaluate_model("Lasso", lasso_model_filename, X_test_combined, y_test, metrics=metrics, use_subset=True)
+    if "LightGBMTop15" in models:
+        # Evaluate LightGBM model
+        print("Evaluating LightGBMTop15 model...")
+        lgb_model_filename = f"{MODEL_DIR}/lgb_model_top_15_20250621_213411.txt"    
+        evaluate_model("LightGBMTop15", lgb_model_filename, X_test_lgb_top, y_test, metrics=metrics, use_subset=True)
+
+    if "LightGBMFull" in models:
+        print("Evaluating LightGBMFull model...")
+        lgb_model_filename = f"{MODEL_DIR}/lgb_model_20250621_213411.txt"    
+        evaluate_model("LightGBMFull", lgb_model_filename, X_test_features, y_test, metrics=metrics, use_subset=True)
+    
+    if "LassoTop15" in models:
+        print("Evaluating Top Lasso model...")
+        lasso_model_filename = f"{MODEL_DIR}/lasso_model_top15_20250621_223226.joblib"
+        evaluate_model("LassoTop15", lasso_model_filename, X_test_lasso_top, y_test, metrics=metrics, use_subset=True)    
+    
+    if "LassoFull" in models:
+        # Evaluate Lasso model
+        print("Evaluating Full Lasso model...")
+        lasso_model_filename = f"{MODEL_DIR}/lasso_model_20250621_223226.joblib"
+        evaluate_model("LassoFull", lasso_model_filename, X_test_features, y_test, metrics=metrics, use_subset=True)
+
+    
