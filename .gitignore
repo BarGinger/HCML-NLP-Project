@@ -6,3 +6,6 @@ __pycache__
 *.iml
 /venv
 main
+Data/X_train_combined.csv
+Data/X_test_combined.csv
+Data/X_val_combined.csv
