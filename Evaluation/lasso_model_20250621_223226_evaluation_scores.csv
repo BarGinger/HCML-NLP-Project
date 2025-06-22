@@ -1,0 +1,11 @@
+model_name,metric,score
+LassoFull,Complexity,4.906581473449348
+LassoFull,Sparsity,0.48118100374301265
+LassoFull,Robustness,2.020040567039008e-08
+LassoFull,Faithfulness,0.632148783549217
+LassoFull,Max-Sensitivity,2.563196046167178e-08
+LassoFull,MAE,2.178507895171588
+LassoFull,MSE,7.2641916538582665
+LassoFull,R-squared,0.3151998349088543
+LassoFull,MAPE,0.8384123894942739
+LassoFull,Cohen's Kappa,0.04234780550454764

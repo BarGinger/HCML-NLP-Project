@@ -2,11 +2,16 @@ import pandas as pd
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import Lasso
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, cohen_kappa_score
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from sklearn.model_selection import train_test_split
+from feature_extraction import load_data, save_optuna_plots
 import optuna
 from scipy.sparse import hstack
+from tqdm import tqdm
+
+# Define the directory path
+output_dir = "Output"
 
 def feature_extraction(df, tfidf_vectorizer=None, fit=False):
     df = df.copy()
@@ -39,6 +44,7 @@ def run_lasso_model(df, target_column='rating', test_size=0.2, alpha=0.01):
     lasso.fit(X_train.toarray(), y_train)  # Lasso needs dense arrays
 
     y_pred = lasso.predict(X_test.toarray())
+    y_pred = np.round(y_pred).astype(int) # Round predictions to nearest integer
     mse = mean_squared_error(y_test, y_pred)
     print("MSE:", mse)
 
@@ -136,35 +142,55 @@ def analyze_lasso_coefficients(lasso_model, tfidf_vectorizer):
     print("\nTop negative coefficients:")
     print(coef_df.tail(20))
 
+
 def run_lasso_with_optuna(X_train, y_train, X_val, y_val, X_test, y_test, tfidf_vectorizer, svd,
                            target_column='rating', test_size=0.2, n_trials=30):
-    
-    # tfidf_features, sentiment_scores, tfidf_vectorizer = feature_extraction(df, fit=True)
-    # X_combined = hstack([tfidf_features, sentiment_scores])
-    # y = df[target_column].values
-
-    # X_train_full, X_test, y_train_full, y_test = train_test_split(X_combined, y, test_size=test_size, random_state=42)
-    # X_train, X_val, y_train, y_val = train_test_split(X_train_full, y_train_full, test_size=0.25, random_state=42)
 
     def objective(trial):
         alpha = trial.suggest_float("alpha", 1e-4, 1.0, log=True)
-        model = Lasso(alpha=alpha, max_iter=1000)
+        max_iter = trial.suggest_int("max_iter", 1000, 10000, step=1000)
+        tol = trial.suggest_float("tol", 1e-5, 1e-2, log=True)
+        selection = trial.suggest_categorical("selection", ["cyclic", "random"])
+        fit_intercept = trial.suggest_categorical("fit_intercept", [True, False])
+
+        model = Lasso(
+            alpha=alpha,
+            max_iter=max_iter,
+            tol=tol,
+            selection=selection,
+            fit_intercept=fit_intercept
+        )
         model.fit(X_train, y_train)
         y_val_pred = model.predict(X_val)
-        mae_val = mean_absolute_error(y_val, y_val_pred)
-        return mae_val
+        # Round predictions to nearest integer
+        y_val_pred_int = np.round(y_val_pred).astype(int)
+        # mae_val = mean_absolute_error(y_val, y_val_pred)
+        kappa = cohen_kappa_score(y_val, y_val_pred_int, weights='quadratic')
+        return 1 - kappa  # minimize 1-kappa
 
     study = optuna.create_study(direction='minimize')
-    study.optimize(objective, n_trials=n_trials)
+    with tqdm(total=n_trials, desc="Optuna Lasso Trials", unit="trial") as pbar:
+        def callback(study, trial):
+            pbar.update(1)
+        study.optimize(objective, n_trials=n_trials, callbacks=[callback], show_progress_bar=False)
 
-    best_alpha = study.best_params['alpha']
-    final_model = Lasso(alpha=best_alpha, max_iter=1000)
+    best_params = study.best_params
+    final_model = Lasso(
+        alpha=best_params['alpha'],
+        max_iter=best_params['max_iter'],
+        tol=best_params['tol'],
+        selection=best_params['selection'],
+        fit_intercept=best_params['fit_intercept']
+    )
     final_model.fit(X_train, y_train)
     y_pred = final_model.predict(X_test)
+    y_pred = np.round(y_pred).astype(int)
 
     print(" Best hyperparameters:", study.best_params)
     print(" Best validation MAE:", study.best_value)
     print(" Test MSE:", mean_squared_error(y_test, y_pred))
     print(" Test MAE:", mean_absolute_error(y_test, y_pred))
+
+    save_optuna_plots(study, output_dir, "Lasso", dtick=10)
 
     return final_model, y_pred
