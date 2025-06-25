@@ -15,10 +15,18 @@ from sklearn.linear_model import Lasso
 import joblib
 from check_the_data import feature_extraction # Import the function
 from scipy.sparse import hstack
+from transformers import BertModel
+from transformers import BertTokenizer, BertForSequenceClassification
+from bert import DrugReviewDataset
+from captum.attr import IntegratedGradients, Saliency, GradientShap
+from torch.utils.data import DataLoader
+import torch
+
 
 # Global variable to hold the loaded model
 MODEL_DIR = "Models"
 EVAL_DIR = "Evaluation"
+DATA_DIR = "Data"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
@@ -61,6 +69,53 @@ def load_lasso_model(filename=None):
         filename = f"{MODEL_DIR}/trained_lasso_model.joblib"  # Example filename
     lasso_model = joblib.load(filename)
     return lasso_model
+
+
+def load_bert_model(path=None):
+    """
+    Load a BERT model from a file.
+
+    Parameters:
+    path (str): The path to the model file.
+
+    Returns:
+    BertModel: The loaded BERT model.
+    """    
+    if path is None:
+        path = f"{MODEL_DIR}/bert_model"
+    
+    tokenizer = BertTokenizer.from_pretrained(path)
+    model = BertForSequenceClassification.from_pretrained(path)
+    model.to(device)  # Move the model to the appropriate device (GPU or CPU)
+    return model, tokenizer
+
+
+def get_dataloader_for_bert_model(df, y_test, col, tokenizer, batch_size=2, max_length=128, shuffle=False):
+    """
+    Load inputs for the BERT model from a DataFrame.
+
+    Parameters:
+    df (pd.DataFrame): DataFrame containing the text data.
+    y_test (pd.Series): Series containing the target labels.
+    col (str): Column name containing the text data.
+    tokenizer (BertTokenizer): Tokenizer for BERT.
+    max_length (int): Maximum length of the input sequences.
+    batch_size (int): Batch size for the DataLoader.
+    shuffle (bool): Whether to shuffle the data.
+
+    Returns:
+    DataLoader: DataLoader for the BERT model.
+    """
+    # Use the same column and tokenizer as in training
+    dataset = DrugReviewDataset(
+        texts=df[col].to_numpy(),
+        ratings=y_test.to_numpy(),
+        tokenizer=tokenizer,
+        max_len=max_length  # or whatever you used in training
+    )
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+
+    return loader
 
 
 def calc_complexity(model, model_name, x_batch, y_batch, explanations_padded, device='cpu'):  
@@ -169,7 +224,7 @@ class LightGBMWrapper(torch.nn.Module):
     def forward(self, x):
         """
         Forward pass for the LightGBM model.
-
+ 
         Parameters:
         x: Input features (NumPy array or PyTorch tensor).
 
@@ -251,6 +306,96 @@ class LightGBMWrapper(torch.nn.Module):
 
         return shap_values  # Don't wrap again in np.array
 
+class BertWrapper(torch.nn.Module):
+    def __init__(self, model, device):
+        super().__init__()
+        self.model = model
+        self.device = device
+
+    def get_embeddings(self, input_ids):
+        return self.model.bert.embeddings(input_ids)
+
+    def forward(self, inputs_embeds, attention_mask):
+        # input_ids = input_ids.long()  # Ensure input_ids is of type long
+        outputs = self.model(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
+        return outputs.logits  # Only return logits tensor
+
+    def predict(self, dataloader):
+        self.model.eval()
+        all_preds, all_labels = [], []
+        total = len(dataloader)
+        with torch.no_grad(), tqdm(total=total, desc="BERT Predict", unit="batch") as pbar:
+            for batch in dataloader:
+                input_ids = batch["input_ids"].to(self.device)
+                input_ids = input_ids.long()  # Ensure input_ids is of type long
+                attention_mask = batch["attention_mask"].to(self.device)
+                labels = batch["labels"].cpu().numpy()
+                outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+                preds = outputs.logits.squeeze(-1).cpu().numpy()
+                all_preds.append(preds)
+                all_labels.append(labels)
+                pbar.update(1)
+        y_pred = np.concatenate(all_preds)
+        y_true = np.concatenate(all_labels)
+        return y_true, y_pred
+    
+
+    def generate_saliency_map(self, batch_or_array):
+        self.eval()
+        # ig = IntegratedGradients(self)
+        gradientShap = GradientShap(self)
+        explainer = gradientShap
+
+        all_attributions = []
+
+        if isinstance(batch_or_array, DataLoader):
+            dataloader = batch_or_array
+            total = len(dataloader)
+            with tqdm(total=total, desc="BERT Saliency", unit="batch") as pbar:
+                for batch in dataloader:
+                    input_ids = batch["input_ids"].to(self.device)
+                    attention_mask = batch["attention_mask"].to(self.device)
+                    inputs_embeds = self.model.bert.embeddings(input_ids)
+                    baselines = torch.zeros_like(inputs_embeds)
+                    attributions = explainer.attribute(
+                        inputs=inputs_embeds,
+                        baselines=baselines,
+                        additional_forward_args=(attention_mask,)
+                    )
+                    # Reduce to 2D
+                    if attributions.ndim == 3:
+                        attributions = torch.norm(attributions, dim=-1)
+                    all_attributions.append(attributions.detach().cpu().numpy())
+                    pbar.update(1)
+                    torch.cuda.empty_cache()
+            return np.concatenate(all_attributions)
+
+        elif isinstance(batch_or_array, np.ndarray):
+            input_ids_np = batch_or_array
+            vocab_size = self.model.bert.embeddings.word_embeddings.num_embeddings
+            batch_size = 2  # Set to 1 or 2 to avoid OOM
+
+            all_attributions = []
+            for i in range(0, input_ids_np.shape[0], batch_size):
+                input_ids = torch.tensor(input_ids_np[i:i+batch_size], dtype=torch.long, device=self.device)
+                input_ids = input_ids.clamp(0, vocab_size - 1)
+                attention_mask = (input_ids != 0).long()
+                inputs_embeds = self.model.bert.embeddings(input_ids)
+                # Create baseline: zeros of same shape as inputs_embeds
+                baselines = torch.zeros_like(inputs_embeds)
+                attributions = explainer.attribute(
+                    inputs=inputs_embeds,
+                    baselines=baselines,
+                    additional_forward_args=(attention_mask,)
+                )
+                # Reduce to 2D
+                if attributions.ndim == 3:
+                    attributions = torch.norm(attributions, dim=-1)
+                all_attributions.append(attributions.detach().cpu().numpy())
+                torch.cuda.empty_cache()
+            return np.concatenate(all_attributions, axis=0)
+        else:
+            raise ValueError("Input to generate_saliency_map must be a DataLoader or np.ndarray.")
 def calculate_sparsity(a_batch, threshold=1e-5):
     """
     Calculate the sparsity of saliency maps.
@@ -514,7 +659,7 @@ def calculate_robustness_metric(model, x_batch, y_batch, a_batch):
     """Calculate Robustness metric."""
     print("Calculating Robustness Metric...")
     metric_robustness = quantus.LocalLipschitzEstimate(
-        nr_samples=10,  # Number of samples to estimate the Lipschitz constant
+        nr_samples=5,  # Number of samples to estimate the Lipschitz constant
         perturb_std=0.4,  # Standard deviation of the Gaussian noise for perturbation
         perturb_mean=0.0,  # Mean of the Gaussian noise for perturbation
         norm_numerator=quantus.similarity_func.distance_euclidean,  # Function to compute the distance in the numerator
@@ -536,6 +681,65 @@ def calculate_robustness_metric(model, x_batch, y_batch, a_batch):
     robustness_score_mean = np.mean(robustness_scores)
     print(f"Robustness Score (mean): {robustness_score_mean}")
     return robustness_score_mean
+
+def calculate_bert_faithfulness_correlation_metric(model, x_batch, y_batch, a_batch, tokenizer, subset_size=5, nr_runs=10):
+    """
+    Faithfulness correlation for BERT: 
+    Perturb top-k tokens (by attribution) to [PAD] and measure prediction change.
+    """
+    print("Calculating BERT Faithfulness Correlation Metric...")
+    n, seq_len = x_batch.shape
+    prediction_changes = []
+    importance_scores = []
+
+    pad_token_id = tokenizer.pad_token_id
+
+    for run in range(nr_runs):
+        for i in range(n):
+            input_ids = x_batch[i].copy()
+            attributions = a_batch[i]
+
+            # Get top-k important tokens (ignore [PAD] tokens)
+            valid_mask = input_ids != pad_token_id
+            valid_indices = np.where(valid_mask)[0]
+            if len(valid_indices) == 0:
+                continue
+            abs_attributions = np.abs(attributions[valid_indices])
+            topk_indices = valid_indices[np.argsort(abs_attributions)[-subset_size:]]
+
+            # Perturb: set top-k tokens to [PAD]
+            input_ids_perturbed = input_ids.copy()
+            input_ids_perturbed[topk_indices] = pad_token_id
+
+            # Prepare tensors
+            input_ids_tensor = torch.tensor(input_ids, dtype=torch.long, device=model.device).unsqueeze(0)
+            input_ids_perturbed_tensor = torch.tensor(input_ids_perturbed, dtype=torch.long, device=model.device).unsqueeze(0)
+            attention_mask = (input_ids_tensor != pad_token_id).long()
+            attention_mask_perturbed = (input_ids_perturbed_tensor != pad_token_id).long()
+
+            # Get predictions
+            with torch.no_grad():
+                inputs_embeds = model.model.bert.embeddings(input_ids_tensor)
+                pred = model(inputs_embeds, attention_mask).cpu().numpy().squeeze()
+                inputs_embeds_perturbed = model.model.bert.embeddings(input_ids_perturbed_tensor)
+                pred_perturbed = model(inputs_embeds_perturbed, attention_mask_perturbed).cpu().numpy().squeeze()
+
+            prediction_change = abs(pred - pred_perturbed)
+            importance_sum = np.sum(np.abs(attributions[topk_indices]))
+
+            prediction_changes.append(prediction_change)
+            importance_scores.append(importance_sum)
+
+    # Correlation
+    if len(prediction_changes) > 1 and np.std(prediction_changes) > 0 and np.std(importance_scores) > 0:
+        correlation = np.corrcoef(importance_scores, prediction_changes)[0, 1]
+        if np.isnan(correlation):
+            correlation = 0.0
+    else:
+        correlation = 0.0
+
+    print(f"BERT Faithfulness Correlation Score: {correlation:.4f}")
+    return correlation
 
 def calculate_faithfulness_correlation_metric(model, x_batch, y_batch, a_batch):
     """Calculate Faithfulness Correlation metric."""
@@ -778,7 +982,7 @@ def calculate_mape_metric(y_true, y_pred, model_name):
     mape = mean_absolute_percentage_error(y_true, y_pred)
     return mape
 
-def evaluate_model(model_type, model_filename, X_test_combined, y_test, metrics=None, use_subset=False):
+def evaluate_model(model_type, model_filename, X_test_combined, y_test, metrics=None, use_subset=False, test_df=None):
     """
     Evaluate a given model (LGBM or Lasso) using various metrics.
     """
@@ -796,17 +1000,58 @@ def evaluate_model(model_type, model_filename, X_test_combined, y_test, metrics=
         y_test_pred = model.predict(X_test_combined)        
         wrapped_model = LassoWrapper(model, feature_names=X_test_combined.columns)
         explanations_padded = wrapped_model.generate_saliency_map(X_test_combined)
+    elif "BERT" in model_type:
+        model, tokenizer = load_bert_model(path=model_filename)
+        test_loader = get_dataloader_for_bert_model(test_df, y_test=y_test, col='review_clean', tokenizer=tokenizer, batch_size=2, max_length=128, shuffle=False)
+        wrapped_model = BertWrapper(model, device)
+        bert_preds_path = os.path.join(model_filename, "test_preds.npy")
+        bert_labels_path = os.path.join(model_filename, "test_labels.npy")
+
+        if os.path.exists(bert_preds_path) and os.path.exists(bert_labels_path):
+            print("Loading cached BERT predictions...")
+            y_test_true = np.load(bert_labels_path)[:len(test_df)]
+            y_test_pred = np.load(bert_preds_path)[:len(test_df)]
+        else:
+            print("Predicting BERT test set...")
+            y_test_true, y_test_pred = wrapped_model.predict(test_loader)
+            np.save(bert_labels_path, y_test_true)
+            np.save(bert_preds_path, y_test_pred)
+        bert_attr_path = os.path.join(model_filename, "test_attributions.npy")
+        
+        if os.path.exists(bert_attr_path):
+            print("Loading cached BERT attributions...")
+            explanations_padded = np.load(bert_attr_path)
+        else:
+            print("Calculating BERT attributions...")
+            explanations_padded = wrapped_model.generate_saliency_map(test_loader)
+            np.save(bert_attr_path, explanations_padded)
     else:
         raise ValueError("Invalid model_type. Choose 'LightGBM' or 'Lasso'.")
 
     wrapped_model.eval()
 
-    x_batch_np = np.array(X_test_combined.values, dtype=np.float32)
-    a_batch_np = np.array(explanations_padded, dtype=np.float32)
-    y_batch_np = np.array(y_test.values, dtype=np.int32)
+    if "BERT" in model_type:
+        x_batch_np = np.stack([batch["input_ids"].cpu().numpy() for batch in test_loader])
+        x_batch_np = x_batch_np.reshape(-1, x_batch_np.shape[-1])  # (num_samples, seq_len)
+        a_batch_np = np.array(explanations_padded, dtype=np.float32)        
+        if a_batch_np.ndim == 3:
+            a_batch_np = np.linalg.norm(a_batch_np, axis=-1)  # <-- Fix here
+        y_batch_np = np.array(y_test_true, dtype=np.float32)
+        explanations_padded = a_batch_np
+
+        print(f"x_batch_np shape: {x_batch_np.shape}")
+        print(f"a_batch_np shape: {a_batch_np.shape}")  
+        print(f"y_batch_np shape: {y_batch_np.shape}")
+        if x_batch_np.shape[0] != a_batch_np.shape[0] or x_batch_np.shape[0] != y_batch_np.shape[0]:
+            raise ValueError("Mismatch in number of samples between x_batch, a_batch, and y_batch.")
+    else:
+        # For LGBM/Lasso, use tabular features
+        x_batch_np = np.array(X_test_combined.values, dtype=np.float32)
+        a_batch_np = np.array(explanations_padded, dtype=np.float32)
+        y_batch_np = np.array(y_test.values, dtype=np.int32)
 
     if use_subset:
-        subset_size = min(10000, len(x_batch_np))
+        subset_size = min(100, len(x_batch_np))
         subset_indices = np.random.choice(len(x_batch_np), size=subset_size, replace=False)
         x_batch_np_small = x_batch_np[subset_indices]
         y_batch_np_small = y_batch_np[subset_indices]
@@ -818,7 +1063,13 @@ def evaluate_model(model_type, model_filename, X_test_combined, y_test, metrics=
 
     # Metric Calculations - using helper functions
     if "complexity" in metrics:
-        complexity_score = calc_complexity(model=wrapped_model, model_name=model_name, x_batch=x_batch_np, y_batch=y_batch_np, explanations_padded=explanations_padded, device=device)
+        complexity_score = calc_complexity(
+                                model=wrapped_model,
+                                model_name=model_name,
+                                x_batch=x_batch_np,
+                                y_batch=y_batch_np,
+                                explanations_padded=explanations_padded,
+                                device=device)
         results.append({"model_name": model_name, "metric": "Complexity", "score": complexity_score})
 
     if "sparsity" in metrics:
@@ -831,7 +1082,18 @@ def evaluate_model(model_type, model_filename, X_test_combined, y_test, metrics=
         results.append({"model_name": model_name, "metric": "Robustness", "score": robustness_score_mean})
 
     if "faithfulness_correlation" in metrics:
-        faithfulness_score = calculate_faithfulness_correlation_metric(model=wrapped_model, x_batch=x_batch_np_small, y_batch=y_batch_np_small, a_batch=a_batch_np_small)
+        if "BERT" in model_type:
+            faithfulness_score = calculate_bert_faithfulness_correlation_metric(
+                model=wrapped_model,
+                x_batch=x_batch_np_small,
+                y_batch=y_batch_np_small,
+                a_batch=a_batch_np_small,
+                tokenizer=tokenizer,
+                subset_size=5,   # or another value
+                nr_runs=2        # keep low for speed
+            )
+        else: 
+            faithfulness_score = calculate_faithfulness_correlation_metric(model=wrapped_model, x_batch=x_batch_np_small, y_batch=y_batch_np_small, a_batch=a_batch_np_small)
         print(f"Faithfulness Correlation Score: {faithfulness_score:.4f}")
         results.append({"model_name": model_name, "metric": "Faithfulness", "score": faithfulness_score})
 
@@ -897,24 +1159,6 @@ def evaluate_model(model_type, model_filename, X_test_combined, y_test, metrics=
 if __name__ == '__main__':
     print("Loading data...")
 
-    X_train_combined, y_train, X_val_combined, y_val, X_test_combined, y_test, tfidf_vectorizer, svd = load_data()
-
-    X_train_features = X_train_combined.drop(columns=['patient_id'])
-    X_val_features = X_val_combined.drop(columns=['patient_id'])
-    X_test_features = X_test_combined.drop(columns=['patient_id'])
-
-    # load top features from JSON file for LightGBM
-    with open(f"{MODEL_DIR}/top_15_features.json", "r") as f:
-        lgb_top_features = json.load(f)
-
-    X_test_lgb_top = X_test_features[lgb_top_features]
-
-    # load top features from JSON file for Lasso
-    with open(f"{MODEL_DIR}/lasso_model_top_15_features_20250621_223226.json", "r") as f:
-        lasso_top_features = json.load(f)
-
-    X_test_lasso_top = X_test_features[lasso_top_features]
-
     metrics = [
         "complexity",
         "sparsity",
@@ -931,9 +1175,38 @@ if __name__ == '__main__':
     models = [
         # "LightGBMTop15",
         # "LightGBMFull",        
-        "LassoFull",
-        "LassoTop15"
+        # "LassoFull",
+        # "LassoTop15"
+        "BERT"
     ]
+
+    X_train_combined, y_train, X_val_combined, y_val, X_test_combined, y_test, tfidf_vectorizer, svd = load_data()
+    X_train_features = X_train_combined.drop(columns=['patient_id'])
+    X_val_features = X_val_combined.drop(columns=['patient_id'])
+    X_test_features = X_test_combined.drop(columns=['patient_id'])
+    df_test = None
+
+    if "BERT" in models:
+         df_test = pd.read_csv(f"{DATA_DIR}/drug_review_test_clean.csv")
+         df_test = df_test.head(100)  # Limit to 100 samples for BERT evaluation
+         y_test = y_test[:len(df_test)]  # Ensure y_test matches df_test length
+
+
+    if "LightGBMTop15" in models or "LightGBMFull" in models or "LassoTop15" in models or "LassoFull" in models:
+        # load top features from JSON file for LightGBM
+        with open(f"{MODEL_DIR}/top_15_features.json", "r") as f:
+            lgb_top_features = json.load(f)
+
+        X_test_lgb_top = X_test_features[lgb_top_features]
+
+        # load top features from JSON file for Lasso
+        with open(f"{MODEL_DIR}/lasso_model_top_15_features_20250621_223226.json", "r") as f:
+            lasso_top_features = json.load(f)
+
+        X_test_lasso_top = X_test_features[lasso_top_features]
+
+   
+    
     print("Starting evaluation...")
 
     if "LightGBMTop15" in models:
@@ -958,4 +1231,8 @@ if __name__ == '__main__':
         lasso_model_filename = f"{MODEL_DIR}/lasso_model_20250621_223226.joblib"
         evaluate_model("LassoFull", lasso_model_filename, X_test_features, y_test, metrics=metrics, use_subset=True)
 
-    
+    if "BERT" in models:
+        # Evaluate BERT model
+        print("Evaluating BERT model...")
+        bert_model_folder = f"{MODEL_DIR}/bert_model"
+        evaluate_model("BERT", bert_model_folder, X_test_features, y_test, metrics=metrics, use_subset=True, test_df=df_test)
