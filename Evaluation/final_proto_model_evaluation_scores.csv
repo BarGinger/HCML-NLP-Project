@@ -1,0 +1,7 @@
+model_name,metric,score
+Proto-lm,Max-Sensitivity,628005.9986752269
+Proto-lm,MAE,3.64
+Proto-lm,MSE,25.6
+Proto-lm,R-squared,-1.0728073584661226
+Proto-lm,MAPE,2.2375396825396825
+Proto-lm,Cohen's Kappa,0.0

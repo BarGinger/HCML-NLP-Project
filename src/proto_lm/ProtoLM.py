@@ -5,7 +5,7 @@ from transformers import AutoConfig, AutoModelForSequenceClassification
 import pytorch_lightning as pl
 import torchmetrics.functional as tmf
 import torchmetrics.functional.classification as tmfc
-from utils import get_sims_for_prototypes
+# from proto_lm.utils import get_sims_for_prototypes
 
 class proto_lm(pl.LightningModule):
     def __init__(self,
@@ -200,6 +200,29 @@ class proto_lm(pl.LightningModule):
         inputs_embeds = inputs.get("inputs_embeds", None)
         input_ids = inputs.get("input_ids", None)
         attention_mask = inputs.get("attention_mask", None)
+
+
+        if inputs_embeds is not None and inputs_embeds.dim() == 2:
+            # Add batch dimension if missing
+            inputs_embeds = inputs_embeds.unsqueeze(0)
+        if attention_mask is not None and attention_mask.dim() == 1:
+            attention_mask = attention_mask.unsqueeze(0)
+
+        if inputs_embeds is not None and attention_mask is not None:
+            # If Captum/Quantus expands the batch, repeat attention_mask if needed
+            if attention_mask.shape[0] == 1 and inputs_embeds.shape[0] > 1:
+                attention_mask = attention_mask.repeat(inputs_embeds.shape[0], 1)
+            # If attention_mask is too short in seq_len, pad it
+            if attention_mask.shape[1] < inputs_embeds.shape[1]:
+                pad_len = inputs_embeds.shape[1] - attention_mask.shape[1]
+                attention_mask = torch.nn.functional.pad(attention_mask, (0, pad_len), value=0)
+            # If attention_mask is too long, trim it
+            if attention_mask.shape[1] > inputs_embeds.shape[1]:
+                attention_mask = attention_mask[:, :inputs_embeds.shape[1]]
+            # Now check
+            if attention_mask.shape[1] != inputs_embeds.shape[1]:
+                print(f"[ERROR] In proto_lm.forward: attention_mask shape: {attention_mask.shape}, inputs_embeds shape: {inputs_embeds.shape}")
+                raise ValueError("attention_mask must match the sequence length of inputs_embeds.")
 
         # Debugging: Print input shapes
         # print(f"ProtoLM.forward() called with:")

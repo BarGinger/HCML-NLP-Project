@@ -11,3 +11,7 @@ Data/X_test_combined.csv
 Data/X_val_combined.csv
 Data/Data.zip
 Models/BERT.zip
+Data/X_test_combined.csv
+Data/X_train_combined.csv
+Data/X_val_combined.csv
+Models/bert_model/model.safetensors
