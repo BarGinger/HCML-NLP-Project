@@ -15,7 +15,8 @@ import shap
 import matplotlib.pyplot as plt
 from sklearn.feature_selection import VarianceThreshold
 from tqdm import tqdm  # Add this import at the top of your file
-
+import lightgbm as lgb
+from lightgbm import LGBMRegressor
 
 
 def feature_extraction(df, tfidf_vectorizer=None, svd=None, fit=False, selected_feature_names=None):
@@ -49,7 +50,7 @@ def feature_extraction(df, tfidf_vectorizer=None, svd=None, fit=False, selected_
     X_combined = np.hstack([tfidf_svd, sentiment_scores, review_length])
 
     # Create feature names for DataFrame
-    feature_names = [f"SVD_{i}" for i in range(n_components)] + ["Sentiment", "ReviewLength"]
+    feature_names = [f"SVD{i}" for i in range(n_components)] + ["Sentiment", "ReviewLength"]
     X_combined_df = pd.DataFrame(X_combined, columns=feature_names, index=df.index)
 
     feature_cols = [col for col in X_combined_df.columns if col not in ['patient_id']]
@@ -245,20 +246,33 @@ def explain_and_plot_top_features(
     """
     if custom_labels is None:
         custom_labels = {
-            "svd_1": "Birth control side effect",
-            "svd_15": "General effectiveness",
-            "svd_11": "Impact on daily life",
-            "svd_0": "Treatment timeline",
-            "svd_21": "Lifestyle interactions (cravings/withdrawal)",
-            "svd_7": "Subjective experience/mood",
-            "svd_3": "Hormonal issues",
-            "svd_28": "Intense emotional reactions",
-            "svd_24": "Dose adjustments",
-            "sentiment": "General sentiment"
+            "SVD": "Treatment timeline",
+            "SVD_11": "Impact on daily life",
+            "SVD_15": "General effectiveness",
+            "SVD_24": "Dose adjustments",
+            "SVD_9": "Dosage and symptom management",
+            "SVD_1": "Birth control side effect",
+            "SVD_2": "Emotional and physical symptoms",
+            "SVD_28": "Drug efficacy (sex/migraine related)",
+            "SVD_38": "Improved life and mood changes",
+            "SVD_21": "Lifestyle interactions (cravings/withdrawal)",
+            "SVD_26": "Injection-related side effects",
+            "SVD_69": "Severe and long-term side effects",
+            "SVD_42": "Infections and application-specific issues",
+            "SVD_60": "Weight and appearance changes",
+            "SVD_20": "Effect symptoms on daily life",
+            "SVD_93": "Dose-dependent physical and mood effects",
+            "SVD_34": "Mood and sexual side effects",
+            "SVD_33": "Emotional effect during start",
+            "SVD_13": "Hormonal treatment (emotional) effects",
+            "SVD_7": "General feelings on hormonal dosage",
+            "ReviewLength": "Review length",
+            "sentiment": "General sentiment",
+            "Sentiment": "General sentiment"
         }
 
     def get_feature_label(col):
-        return custom_labels.get(str(col).lower(), col)
+        return custom_labels.get(str(col), col)
     
     X_test_features = X_test.drop(columns=['patient_id'])
 
@@ -331,16 +345,16 @@ def explain_and_plot_top_features(
             print("**********************************************************************************************************")
             print(f"\nPatient ID: {pid}, Predicted rating: {pred_label}", f"True rating: {true_label}\n")
 
-            if model_type == "lgb":
-                shap_values_instance_full = shap_values[instance_idx]
-                expected_value = explainer.expected_value
-                top_indices = [list(X_test_features.columns).index(col) for col in top_columns]
-                shap_values_instance = shap_values_instance_full[top_indices]
-            elif model_type == "lasso":
+            
+            if model_type == "lasso":
                 shap_values_instance_full = shap_values.values[instance_idx]
                 expected_value = shap_values.base_values[instance_idx]
                 top_indices = [list(X_test_features.columns).index(col) for col in top_columns]
                 shap_values_instance = shap_values_instance_full[top_indices]
+            elif model_type == "lgb":
+                # For LGBM, shap_values is a numpy array: shape (n_samples, n_features)
+                shap_values_instance = shap_values[instance_idx][top_idx]
+                expected_value = explainer.expected_value
             else:
                 return
 
@@ -350,9 +364,142 @@ def explain_and_plot_top_features(
                 feature_names=[get_feature_label(col) for col in top_columns],
                 show=False,
             )
-            plt.title(f"Patient ID: {pid} | True label: {true_label} | Predicted: {pred_label:.2f}")
+
+            model_name_for_fig = None
+            if model_type == "lgb":
+                model_name_for_fig = "LightGBM"
+            elif model_type == "lasso":
+                model_name_for_fig = "Linear Regression"
+
+            plt.title(f"Model: {model_name_for_fig} | Patient ID: {pid} | True label: {true_label} | Predicted: {pred_label:.2f}")
             plt.tight_layout()
             plt.subplots_adjust(left=0.35)
             os.makedirs(output_dir, exist_ok=True)
             plt.savefig(f"{output_dir}/shap_waterfall_{model_name}_patient_{pid}.png", bbox_inches='tight')
             plt.close(fig)
+
+best_params = {
+    "boosting_type": "gbdt",
+    "class_weight": None,
+    "colsample_bytree": 0.8727997023689377,
+    "importance_type": "split",
+    "learning_rate": 0.09537421349587011,
+    "max_depth": 8,
+    "min_child_samples": 35,
+    "min_child_weight": 0.001,
+    "min_split_gain": 0.0,
+    "n_estimators": 247,
+    "n_jobs": None,
+    "num_leaves": 50,
+    "objective": None,
+    "random_state": 42,
+    "reg_alpha": 0.041931634200662975,
+    "reg_lambda": 0.2845551994554308,
+    "subsample": 0.6873121927685539,
+    "subsample_for_bin": 200000,
+    "subsample_freq": 0
+}
+def apply_lgb_with_params(X_train, y_train, X_val, y_val, X_test, y_test, best_params):
+    lgb_model = lgb.LGBMRegressor(**best_params)
+
+    lgb_model.fit(X_train, y_train)
+    y_val_pred_temp = lgb_model.predict(X_val)
+    y_test_pred_temp = lgb_model.predict(X_test)
+
+    # Round predictions to nearest integer
+    y_val_pred = np.round(y_val_pred_temp).astype(int)
+    y_test_pred = np.round(y_test_pred_temp).astype(int)
+
+    #mae_val = mean_absolute_error(y_val, y_val_pred)
+    #mse_val = mean_squared_error(y_val, y_val_pred)
+    #mae_test = mean_absolute_error(y_test, y_test_pred)
+    #mse_test = mean_squared_error(y_test, y_test_pred)
+
+    return lgb_model
+
+def load_lasso_model(filename=None):
+    import joblib  # Import joblib here to avoid it being a global requirement
+    if filename is None:
+        filename = f"Models/trained_lasso_model.joblib"  # Example filename
+    lasso_model = joblib.load(filename)
+    return lasso_model
+
+import json
+with open("Models/top_15_features.json") as f:
+    top_15_features = json.load(f)
+
+X_train_combined, y_train, X_val_combined, y_val, X_test_combined, y_test, tfidf_vectorizer, svd = load_data()
+
+for col in ["Sentiment", "ReviewLength"]:
+    if col in X_train_combined.columns and col not in top_15_features:
+        top_15_features.append(col)
+
+# lasso_model = load_lasso_model("Models/lasso_model_top15_20250621_223226.joblib")  # Load the Lasso model
+X_train_top15 = X_train_combined[top_15_features]
+X_val_top15 = X_val_combined[top_15_features]
+X_test_top15 = X_test_combined[top_15_features]
+lgb_model = apply_lgb_with_params(X_train_top15, y_train, X_val_top15, y_val, X_test_top15, y_test, best_params)
+
+# importances = np.abs(lasso_model.coef_)
+num_of_top_features = 15
+# feature_names = list(lasso_model.feature_names_in_) # [col for col in X_test_combined.columns if col != "patient_id"]
+timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+
+# Ensure "Sentiment" and "ReviewLength" are included
+# for col in ["Sentiment", "ReviewLength"]:
+#     if col in X_train_combined.columns and col not in feature_names:
+#         feature_names.append(col)
+
+# For Lasso
+explain_and_plot_top_features(
+    lasso_model,
+    X_test_combined[feature_names + ['patient_id']],  # keep patient_id for SHAP
+    y_test,
+    top_n=15,
+    patient_ids=[177996, 134603, 70362, 6760],
+    output_dir="Output",
+    model_type="lasso",
+    model_name=f"lasso_top_{10}_{timestamp}"
+)
+
+# Instance-level explanations with SHAP
+import shap
+explainer = shap.TreeExplainer(lgb_model)
+shap_values = explainer.shap_values(X_test_top15)
+
+# Visualize explanation for the first test instance
+instance_idx = 0  # Change this to look at other instances
+print(f"True rating: {y_test.iloc[instance_idx]}")
+print(f"Predicted rating: {lgb_model.predict(X_test_top15.iloc[[instance_idx]])[0]:.2f}")
+
+# Optionally, show a SHAP force plot in the notebook or browser
+#shap.initjs()
+shap.force_plot(explainer.expected_value, shap_values[instance_idx], feature_names=[f"SVD {i}" for i in range(15)] + ["Sentiment"])
+shap.save_html("shap_force_plot.html", shap.force_plot(
+    explainer.expected_value, shap_values[instance_idx],
+    feature_names=[f"SVD {i}" for i in range(15)] + ["Sentiment"]
+))
+print("SHAP force plot saved as shap_force_plot.html")
+
+# Find index of a high-score and a low-score instance in the test set
+high_idx = y_test.idxmax()
+low_idx = y_test.idxmin()
+
+# Get their positions in the test set (iloc expects integer positions)
+high_pos = y_test.index.get_loc(high_idx)
+low_pos = y_test.index.get_loc(low_idx)
+
+for instance_idx, label in zip([high_pos, low_pos], ["High score", "Low score"]):
+    print(f"\n--- {label} instance ---")
+    print(f"True rating: {y_test.iloc[instance_idx]}")
+    print(f"Predicted rating: {lgb_model.predict(X_test_top15.iloc[[instance_idx]])[0]:.2f}")
+
+    # Save SHAP force plot for each instance
+    shap.save_html(f"shap_force_plot_{label.replace(' ', '_').lower()}.html",
+        shap.force_plot(
+            explainer.expected_value,
+            shap_values[instance_idx],
+            feature_names=[f"SVD {i}" for i in range(15)] + ["Sentiment"]
+        )
+    )
+    print(f"SHAP force plot saved as shap_force_plot_{label.replace(' ', '_').lower()}.html")
