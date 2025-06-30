@@ -9,7 +9,19 @@ from transformers import AutoConfig, AutoTokenizer, AutoModelForSequenceClassifi
 from datasets import load_dataset
 import os
 
-class sst_datamodule(pl.LightningDataModule):
+class DrugReviewDataModule(pl.LightningDataModule):
+    """
+    PyTorch Lightning DataModule for Drug Review Dataset with Sentiment Features
+    
+    Supports both local development and Google Colab environments.
+    Automatically detects environment and uses appropriate data paths.
+    
+    Features:
+    - Regression setup (continuous rating values 1-10)
+    - Sentiment analysis features (VADER scores)
+    - Proper tensor handling to avoid PyTorch warnings
+    - Cross-platform compatibility (local + Colab)
+    """
     loader_columns = [
         "datasets_idx",
         "input_ids",
@@ -42,17 +54,61 @@ class sst_datamodule(pl.LightningDataModule):
         self.dataset = dataset
 
         self.text_fields = ['review_clean']
-        self.num_labels = 10  # Number of classes in drug review dataset, a user can rate from 1 to 10
+        self.num_labels = 10  # Changed to 10 for classification (ratings 1-10 as classes 0-9)
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name_or_path, use_fast=True)
 
-    def load_dataset_locally(self):     
-
-        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "Data"))
+    def load_dataset_locally(self):
+        """
+        Load dataset from local files, automatically detecting Colab vs local environment
+        """
+        # Check if running on Google Colab
+        try:
+            import google.colab
+            is_colab = True
+        except ImportError:
+            is_colab = False
+        
+        if is_colab:
+            # Google Colab paths
+            base_dir = "/content/Data"
+            print("🔍 Detected Google Colab environment")
+        else:
+            # Local development paths
+            base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "Data"))
+            print("🔍 Detected local development environment")
+        
+        print(f"📁 Looking for data files in: {base_dir}")
+        
         data_files = {
             "train": os.path.join(base_dir, "drug_review_train_with_sentiment.csv"),
             "validation": os.path.join(base_dir, "drug_review_validation_with_sentiment.csv"),
             "test": os.path.join(base_dir, "drug_review_test_with_sentiment.csv")
         }
+        
+        # Check if files exist
+        missing_files = []
+        for split, file_path in data_files.items():
+            if not os.path.exists(file_path):
+                missing_files.append(f"{split}: {file_path}")
+        
+        if missing_files:
+            print("❌ Missing data files:")
+            for missing in missing_files:
+                print(f"   - {missing}")
+            
+            if is_colab:
+                print("\n💡 For Google Colab:")
+                print("   1. Upload your data files to /content/Data/ directory")
+                print("   2. Or mount Google Drive and update paths accordingly")
+                print("   3. Make sure files are named correctly with '_with_sentiment.csv' suffix")
+            else:
+                print(f"\n💡 For local development:")
+                print(f"   1. Make sure data files exist in: {base_dir}")
+                print("   2. Check that file names match expected pattern")
+            
+            raise FileNotFoundError(f"Required data files not found in {base_dir}")
+        
+        print("✅ All data files found!")
         self.dataset = load_dataset("csv", data_files=data_files)
 
     def setup(self, stage: str = None):
@@ -104,20 +160,71 @@ class sst_datamodule(pl.LightningDataModule):
             max_length=self.max_seq_length
         )
 
-        # features["labels"] = [1 if int(label) >= 7 else 0 for label in example_batch["label"]]
-        # Convert labels to zero-indexed (1-10 becomes 0-9)
-        features["labels"] = [int(label) - 1 for label in example_batch["label"]]
-        # # Add sentiment features
-        # features["sentiment_neg"] = torch.tensor(example_batch["sentiment_neg"]).unsqueeze(1)
-        # features["sentiment_neu"] = torch.tensor(example_batch["sentiment_neu"]).unsqueeze(1)
-        # features["sentiment_pos"] = torch.tensor(example_batch["sentiment_pos"]).unsqueeze(1)
-        # features["sentiment_compound"] = torch.tensor(example_batch["sentiment_compound"]).unsqueeze(1)
-        # Combine sentiment features into a single tensor
+        # For classification: convert ratings (1-10) to class indices (0-9)
+        features["labels"] = [int(label) - 1 for label in example_batch["label"]]  # Convert 1-10 to 0-9
+        
+        # Add sentiment features - create tensors properly to avoid warnings
+        # Use torch.tensor for numerical data (recommended for lists/arrays)
+        sentiment_neg = torch.tensor(example_batch["sentiment_neg"], dtype=torch.float32)
+        sentiment_neu = torch.tensor(example_batch["sentiment_neu"], dtype=torch.float32)
+        sentiment_pos = torch.tensor(example_batch["sentiment_pos"], dtype=torch.float32)
+        sentiment_compound = torch.tensor(example_batch["sentiment_compound"], dtype=torch.float32)
+        
+        # Stack them into a single tensor for easier processing
         sentiment_features = torch.stack([
-            torch.tensor(example_batch["sentiment_neg"]),
-            torch.tensor(example_batch["sentiment_neu"]),
-            torch.tensor(example_batch["sentiment_pos"]),
-            torch.tensor(example_batch["sentiment_compound"])
+            sentiment_neg,
+            sentiment_neu, 
+            sentiment_pos,
+            sentiment_compound
         ], dim=1)  # Shape: (batch_size, 4)
+        
         features["sentiment_features"] = sentiment_features
         return features
+
+    @staticmethod
+    def setup_colab_data():
+        """
+        Helper method to setup data in Google Colab environment.
+        Call this before creating the data module in Colab.
+        """
+        try:
+            import google.colab  # noqa: F401
+            print("🔧 Setting up data for Google Colab...")
+            
+            # Create data directory
+            import os
+            os.makedirs("/content/Data", exist_ok=True)
+            
+            print("📁 Created /content/Data directory")
+            print("\n📋 Next steps:")
+            print("1. Upload your data files to /content/Data/ using:")
+            print("   - File browser (left sidebar)")
+            print("   - Or drag & drop files")
+            print("   - Or use: from google.colab import files; files.upload()")
+            print("\n📝 Required files:")
+            print("   - drug_review_train_with_sentiment.csv")
+            print("   - drug_review_validation_with_sentiment.csv") 
+            print("   - drug_review_test_with_sentiment.csv")
+            print("\n💡 Alternative: Mount Google Drive and update paths")
+            print("   from google.colab import drive")
+            print("   drive.mount('/content/drive')")
+            
+        except ImportError:
+            print("ℹ️  Not running in Google Colab - no setup needed")
+
+# Backward compatibility alias
+sst_datamodule = DrugReviewDataModule
+
+# Convenience function for quick setup
+def create_drug_review_datamodule(model_name='bert-base-uncased', **kwargs):
+    """
+    Convenience function to create a DrugReviewDataModule with common defaults
+    
+    Args:
+        model_name: HuggingFace model name for tokenizer
+        **kwargs: Additional arguments passed to DrugReviewDataModule
+    
+    Returns:
+        DrugReviewDataModule: Configured data module
+    """
+    return DrugReviewDataModule(model_name_or_path=model_name, **kwargs)

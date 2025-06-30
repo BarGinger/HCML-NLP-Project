@@ -305,7 +305,8 @@ class proto_lm(pl.LightningModule):
         if self.hparams.num_classes > 1: #classification
             ce_loss =  self.l0 * F.cross_entropy(logits, labels)
         elif self.hparams.num_classes == 1: #regression
-            ce_loss = self.l0 * F.mse_loss(logits, labels)
+            # Fix shape mismatch: ensure logits and labels have the same shape
+            ce_loss = self.l0 * F.mse_loss(logits.squeeze(-1), labels)
             labels = torch.zeros(size=labels.size()) #all examples belong to the "0" class, in case of regression
 
         proto_lables = torch.argmax(self.prototype_class_vec, dim=1).cuda()
