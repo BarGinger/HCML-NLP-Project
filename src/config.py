@@ -1,23 +1,25 @@
-import os
+from pathlib import Path
 
-BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = BASE_DIR / "Data"
+MODELS_DIR = BASE_DIR / "models"
+RESULTS_DIR = BASE_DIR / "results"
+TRAIN_FILE_RAW = DATA_DIR / "drug_review_train.csv"
+VALID_FILE_RAW = DATA_DIR / "drug_review_validation.csv"
+TEST_FILE_RAW = DATA_DIR / "drug_review_test.csv"
+TRAIN_FILE_CLEAN = DATA_DIR / "drug_review_train_clean.csv"
+VALID_FILE_CLEAN = DATA_DIR / "drug_review_validation_clean.csv"
+TEST_FILE_CLEAN = DATA_DIR / "drug_review_test_clean.csv"
+TRAIN_FILE_FEATURES = DATA_DIR / "drug_review_train_features.csv"
+VALID_FILE_FEATURES = DATA_DIR / "drug_review_validation_features.csv"
+TEST_FILE_FEATURES = DATA_DIR / "drug_review_test_features.csv"
+TEXT_COLUMN = "review"
+CLEAN_TEXT_COLUMN = "review_clean"
+TARGET_COLUMN = "rating"
+SEED = 42
 
-DATA_DIR = os.path.join(BASE_DIR, "Data")
-EXPERIMENTS_DIR = os.path.join(BASE_DIR, "experiments")
-MODELS_DIR = os.path.join(BASE_DIR, "models")
-RESULTS_DIR = os.path.join(BASE_DIR, "results")
+MAX_FEATURES_TFIDF = 1000
+LASSO_PARAMS = {'alpha': 1.0}
 
-# ==== Data Files ====
-TRAIN_FILE = os.path.join(DATA_DIR, "drug_review_train.csv")
-VALID_FILE = os.path.join(DATA_DIR, "drug_review_validation.csv")
-TEST_FILE = os.path.join(DATA_DIR, "drug_review_test.csv")
-
-# ==== General Constants ====
-SEED = 42        # For reproducibility
-MAX_FEATURES = 1000  # For TF-IDF/Word2Vec
-TEXT_COLUMN = "review"  # Name of the text column in the dataset
-TARGET_COLUMN = "rating"  # Name of the target column
-
-LINEAR_REG_PARAMS = {}
 GBM_PARAMS = {'n_estimators': 100, 'learning_rate': 0.1}
 BERT_MODEL_NAME = 'bert-base-uncased'
