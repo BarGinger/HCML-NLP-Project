@@ -41,8 +41,8 @@ class DrugReviewDataModule(pl.LightningDataModule):
             self,
             model_name_or_path: str,
             max_seq_length: int = 128,
-            train_batch_size: int = 32,
-            eval_batch_size: int = 32,
+            train_batch_size: int = 64,
+            eval_batch_size: int = 64,
             dataset=None,  # Accept pre-loaded dataset
             **kwargs,
     ):
