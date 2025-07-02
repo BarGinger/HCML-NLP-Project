@@ -71,13 +71,13 @@ class DrugReviewDataModule(pl.LightningDataModule):
         if is_colab:
             # Google Colab paths
             base_dir = "/content/Data"
-            print("🔍 Detected Google Colab environment")
+            print(" Detected Google Colab environment")
         else:
             # Local development paths
             base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "Data"))
-            print("🔍 Detected local development environment")
+            print(" Detected local development environment")
         
-        print(f"📁 Looking for data files in: {base_dir}")
+        print(f" Looking for data files in: {base_dir}")
         
         data_files = {
             "train": os.path.join(base_dir, "drug_review_train_with_sentiment.csv"),
@@ -108,7 +108,7 @@ class DrugReviewDataModule(pl.LightningDataModule):
             
             raise FileNotFoundError(f"Required data files not found in {base_dir}")
         
-        print("✅ All data files found!")
+        print(" All data files found!")
         self.dataset = load_dataset("csv", data_files=data_files)
 
     def setup(self, stage: str = None):
@@ -195,7 +195,7 @@ class DrugReviewDataModule(pl.LightningDataModule):
             import os
             os.makedirs("/content/Data", exist_ok=True)
             
-            print("📁 Created /content/Data directory")
+            print(" Created /content/Data directory")
             print("\n📋 Next steps:")
             print("1. Upload your data files to /content/Data/ using:")
             print("   - File browser (left sidebar)")

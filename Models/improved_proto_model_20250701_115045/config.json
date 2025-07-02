@@ -1,0 +1,29 @@
+{
+  "model_name": "bert-base-uncased",
+  "max_seq_length": 100,
+  "num_prototypes": 100,
+  "hidden_shape": 768,
+  "num_classes": 10,
+  "cohsep_ratio": 0.3,
+  "lambda0": 0.05,
+  "lr": 5e-05,
+  "proto_training_weights": 1,
+  "batch_size": 64,
+  "max_epochs": 15,
+  "timestamp": "20250701_115045",
+  "model_type": "ImprovedProtoLM_classification",
+  "class_weights": [
+    0.7641365594961883,
+    2.273570019723866,
+    2.387778353184878,
+    3.175482093663912,
+    1.9259816207184628,
+    2.4789247311827958,
+    1.6840029218407597,
+    0.8502304997234004,
+    0.5783743100852985,
+    0.32297562342392827
+  ],
+  "has_label_smoothing": true,
+  "has_diversity_monitoring": true
+}

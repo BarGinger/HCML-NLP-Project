@@ -1,4 +1,14 @@
-# from sklearn.decomposition import PCA
+"""
+file: src/feature_extraction.py
+This module contains functions for feature extraction from text data, 
+including TF-IDF vectorization, SVD decomposition, sentiment analysis, 
+and feature selection. 
+
+It also includes functions to save and load features and feature names, 
+as well as to compute and save Optuna optimization plots.
+"""
+
+
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import TruncatedSVD
 import numpy as np
@@ -9,12 +19,11 @@ import os
 import joblib
 import json
 from optuna.visualization import plot_optimization_history, plot_param_importances
-from plotly.io import show
 from plotly.io import write_image
 import shap
 import matplotlib.pyplot as plt
 from sklearn.feature_selection import VarianceThreshold
-from tqdm import tqdm  # Add this import at the top of your file
+from tqdm import tqdm 
 
 
 

@@ -1,0 +1,22 @@
+{
+  "text_fields": [
+    "review_clean"
+  ],
+  "num_labels": 1,
+  "max_seq_length": 100,
+  "loader_columns": [
+    "datasets_idx",
+    "input_ids",
+    "token_type_ids",
+    "attention_mask",
+    "start_positions",
+    "end_positions",
+    "labels",
+    "sentiment_features",
+    "sentiment_neg",
+    "sentiment_neu",
+    "sentiment_pos",
+    "sentiment_compound"
+  ],
+  "model_name_or_path": "bert-base-uncased"
+}

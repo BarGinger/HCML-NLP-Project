@@ -1,0 +1,11 @@
+model_name,metric,score
+Proto-lm,Complexity,4.441295821972308
+Proto-lm,Sparsity,0.648204834485978
+Proto-lm,Robustness,0.14470924311898836
+Proto-lm,Faithfulness,0.09414740055188182
+Proto-lm,Max-Sensitivity,0.3760
+Proto-lm,MAE,3.4732584367138024
+Proto-lm,MSE,23.213824065238136
+Proto-lm,R-squared,-1.1883825909010155
+Proto-lm,MAPE,0.8136296717437734
+Proto-lm,Cohen's Kappa,0.08049784105264723

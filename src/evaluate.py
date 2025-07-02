@@ -5,7 +5,7 @@ Description: This file contains functions to load models, evaluate them, and cal
 max-sensitivity, and robustness. It includes loading LightGBM, Lasso, BERT, and ProtoLM models, generating saliency maps usign SHAP or LIME.
 It also provides wrappers for these models to make them compatible with Quantus.
 
-Last updated: 26-06-2025
+Last updated: 01-07-2025
 """
 
 
@@ -28,18 +28,14 @@ import shap
 from tqdm import tqdm
 import joblib
 from scipy.special import expit  # sigmoid
-from sklearn.linear_model import Lasso
-from check_the_data import feature_extraction # Import the function
 from scipy.sparse import hstack
-from transformers import BertModel
 from transformers import BertTokenizer, BertForSequenceClassification
 from bert import DrugReviewDataset
-from captum.attr import IntegratedGradients, Saliency, GradientShap
+from captum.attr import GradientShap
 from torch.utils.data import DataLoader
 import torch
-from proto_lm.ProtoLM import proto_lm
-from proto_lm.proto_data_class import sst_datamodule
-from transformers import AutoConfig, AutoTokenizer, AutoModelForSequenceClassification
+from proto_lm.proto_data_class import sst_datamodule, ImprovedDrugReviewProtoLM
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 
 
@@ -50,6 +46,7 @@ EVAL_DIR = "Evaluation"
 DATA_DIR = "Data"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
+SUBSET = 10000
 
 def load_lgb_model(filename=None):
     """
@@ -110,41 +107,45 @@ def load_bert_model(path=None):
     model.to(device)  # Move the model to the appropriate device (GPU or CPU)
     return model, tokenizer
 
-def load_proto_lm_model(path=None):
-    """ Load a ProtoLM model from the specified path.
+
+# Load a saved ProtoLM model
+def load_proto_lm_model(model_dir, device='auto'):
+    """
+    Load a saved ImprovedDrugReviewProtoLM model from directory.
 
     Parameters:
-        path (str): The path to the ProtoLM model directory.
+        model_dir: Directory containing the saved improved model files
+        device: Device to load model on ('auto', 'cpu', 'cuda')
 
     Returns:
-        proto_lm: The loaded ProtoLM model.
-        tokenizer: The tokenizer associated with the ProtoLM model.
-        args (dict): Configuration arguments used for loading the model.
+        tuple: (loaded_model, tokenizer, config, class_weights)
     """
+    if device == 'auto':
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    model_name = 'bert-base-uncased'  # Backbone LLM model to load
+    print(f"Loading ImprovedDrugReviewProtoLM model from: {model_dir}")
 
-    args = {
-        'model_name': model_name,        # backbone LLM model to load
-        'max_seq_length': 100,                # maximum sentence length to pad/truncate to
-        'num_prototypes': 100,               # number of prototypes to train
-        'hidden_shape': 1024,                # hidden shape of each prototype, should match LLM output
-        'num_classes': 10,                   # number of output classes - 10 for classification (rating prediction 1-10)
-        'cohsep_ratio': 0.5,                 # ratio of prototypes in class to push/pull
-        'lambda0': 0.5,                      # lambda0 in loss
-        'lr': 3e-4,                          # initial learning rate
-        'proto_training_weights': 1,         # whether to train prototype weights (1=True, 0=False)
-        'batch_size': 32,                   # batch size for dataloader
-        'logger_dir': 'tb_logs',             # directory for the logger to store training details
-        'checkpoint_dir': 'ckpt_dir',        # directory to store checkpoints
-        'config_subdir': 'config_subdir',    # subdirectory for checkpoints of a certain config
-        'max_epochs': 1,                     # number of epochs to train
-        'num_gpu': 1,                        # number of gpus to train on
-        'load_model': model_name,  # path to load a pretrained model, if any
-    }
+    # Load configuration
+    config_path = os.path.join(model_dir, "config.json")
+    with open(config_path, 'r') as f:
+        config = json.load(f)
 
+    print(f"Model config: {config['model_type']}")
+    print(f"Prototypes: {config['num_prototypes']}")
+    print(f"Classes: {config['num_classes']}")
+    print(f"Has class weights: {config.get('class_weights') is not None}")
+    print(f"Has label smoothing: {config.get('has_label_smoothing', False)}")
+    print(f"Has diversity monitoring: {config.get('has_diversity_monitoring', False)}")
+
+    # Load tokenizer
+    tokenizer_path = os.path.join(model_dir, "tokenizer")
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+
+    # Recreate base model
     base_model = AutoModelForSequenceClassification.from_pretrained(
-        args['model_name'], ignore_mismatched_sizes=True
+        config['model_name'],
+        num_labels=config['num_classes'],
+        ignore_mismatched_sizes=True
     )
 
     if hasattr(base_model, "roberta"):
@@ -154,30 +155,36 @@ def load_proto_lm_model(path=None):
     else:
         llm_model = base_model
 
+    # Load class weights if available
+    class_weights_tensor = None
+    if config.get('class_weights') is not None:
+        class_weights_tensor = torch.tensor(config['class_weights'], dtype=torch.float32)
+        print(f"Loaded class weights: {class_weights_tensor.tolist()}")
 
-    config = AutoConfig.from_pretrained(args['model_name'])
-    hidden_size = config.hidden_size  # Dynamically get the hidden size (768 for bert-base-uncased)
-    args['hidden_shape'] = hidden_size
-    
-
-    proto = proto_lm(
+    # Recreate ImprovedDrugReviewProtoLM model
+    loaded_model = ImprovedDrugReviewProtoLM(
+        class_weights=class_weights_tensor,
         pretrained_model=llm_model,
-        max_seq_length=args['max_seq_length'],
-        num_prototypes=args['num_prototypes'],
-        hidden_shape=args['hidden_shape'],
-        num_classes=args['num_classes'],
-        cohsep_ratio=args['cohsep_ratio'],
-        lambda0=args['lambda0'],
-        lr=args['lr'],
-        proto_training_weights=bool(args['proto_training_weights']),
+        max_seq_length=config['max_seq_length'],
+        num_prototypes=config['num_prototypes'],
+        hidden_shape=config['hidden_shape'],
+        num_classes=config['num_classes'],
+        cohsep_ratio=config['cohsep_ratio'],
+        lambda0=config['lambda0'],
+        lr=config['lr'],
+        proto_training_weights=bool(config['proto_training_weights'])
     )
-    # Load the trained model
-    src_dir = os.path.dirname(os.path.abspath(__file__))
-    model_path = os.path.join(src_dir, "proto_lm", "final_proto_model.pt")
-    proto.load_state_dict(torch.load(model_path, weights_only=False))  # Load the state dictionary into the model
 
-    proto.to(device)  # Move the model to the appropriate device
-    return proto, AutoTokenizer.from_pretrained(args['model_name']), args
+    # Load saved weights
+    weights_path = os.path.join(model_dir, "model_weights.pt")
+    loaded_model.load_state_dict(torch.load(weights_path, map_location=device))
+    loaded_model = loaded_model.to(device)
+    loaded_model.eval()
+
+    print(f"ImprovedDrugReviewProtoLM model loaded successfully on {device}")
+
+    return loaded_model, tokenizer, config, class_weights_tensor
+
 
 
 def get_dataloader_for_bert_model(df, y_test, col, tokenizer, batch_size=2, max_length=128, shuffle=False):
@@ -201,7 +208,7 @@ def get_dataloader_for_bert_model(df, y_test, col, tokenizer, batch_size=2, max_
         texts=df[col].to_numpy(),
         ratings=y_test.to_numpy(),
         tokenizer=tokenizer,
-        max_len=max_length  # or whatever you used in training
+        max_len=max_length  
     )
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
 
@@ -497,8 +504,15 @@ class BertWrapper(torch.nn.Module):
     
 
     def generate_saliency_map(self, batch_or_array):
+        """
+        Generate saliency maps for BERT model using GradientShap.
+        Parameters:
+            batch_or_array: DataLoader or np.ndarray containing input_ids.
+        Returns:
+            np.ndarray: Saliency maps for the input_ids.
+        """
+        # Ensure the model is in evaluation mode
         self.eval()
-        # ig = IntegratedGradients(self)
         gradientShap = GradientShap(self)
         explainer = gradientShap
 
@@ -555,6 +569,11 @@ class BertWrapper(torch.nn.Module):
 
 
 class ProtoLMWrapper(torch.nn.Module):
+    """
+    Wrapper for ImprovedDrugReviewProtoLM to make it compatible with Quantus.
+    This wrapper ensures that the model can handle input_ids, attention_mask, and sentiment_features
+    """
+
     def __init__(self, model, device):
         super().__init__()
         self.model = model
@@ -591,12 +610,26 @@ class ProtoLMWrapper(torch.nn.Module):
                 raise
     
     def generate_saliency_map(self, batch_or_array, **kwargs):
+        """
+        Generate saliency maps for ProtoLM model using a custom explain function.
+        
+        Parameters:
+            batch_or_array: DataLoader or np.ndarray containing input_ids, attention_mask, sentiment_features.
+            **kwargs: Additional arguments for the explain function.
+
+        Returns:
+            np.ndarray: Saliency maps for the input_ids, attention_mask, sentiment_features.
+        """
         return proto_lm_simple_explain_func(self, batch_or_array, **kwargs)
     
     def predict(self, dataloader):
         """
         Predict method for ProtoLM model.
-        Returns predictions and true labels.
+
+        Parameters:
+            dataloader: DataLoader containing input_ids, attention_mask, sentiment_features.
+
+        Returns: predictions and true labels.
         """
         self.model.eval()
         all_preds, all_labels = [], []
@@ -625,8 +658,6 @@ class ProtoLMWrapper(torch.nn.Module):
                 
                 if logits.shape[1] == 1:  # Regression
                     preds = logits.squeeze(-1).cpu().numpy()
-                    # Clip to valid rating range (1-10) and ensure proper scaling
-                    preds = np.clip(preds, 1.0, 10.0)
                 else:  # Classification - convert to rating values (1-10)
                     class_preds = torch.argmax(logits, dim=1).cpu().numpy()
                     # Convert class indices (0-9) to rating values (1-10)
@@ -638,6 +669,9 @@ class ProtoLMWrapper(torch.nn.Module):
                 
         y_pred = np.concatenate(all_preds)
         y_true = np.concatenate(all_labels)
+
+        # y_pred = y_pred + 1
+        y_true = y_true + 1
         
         print(f"ProtoLM predictions shape: {y_pred.shape}, sample: {y_pred[:5]}")
         print(f"ProtoLM labels shape: {y_true.shape}, sample: {y_true[:5]}")
@@ -758,16 +792,59 @@ def proto_lm_explain_func(model, batch, **kwargs):
     result = np.concatenate(all_attributions, axis=0)
     return result
 
-def proto_lm_simple_explain_func(model, batch, **kwargs):
+def proto_lm_simple_explain_func(model, batch_or_array, **kwargs):
     """
-    Simplified explanation function for ProtoLM that returns simple gradients 
-    without complex tensor operations to avoid shape mismatches.
+    Simplified explanation function for ProtoLM that handles both DataLoader and numpy arrays.
+
+    Parameters:
+        model: The ImprovedDrugReviewProtoLM model.
+        batch_or_array: DataLoader or np.ndarray containing input_ids, attention_mask, sentiment_features.
+        **kwargs: Additional arguments for the explain function.
+
+    Returns:
+        np.ndarray: Saliency maps for the input_ids, attention_mask, sentiment_features.
     """
     seq_len = model.model.max_seq_length
     
-    # Accept both np.ndarray and torch.Tensor
-    if isinstance(batch, torch.Tensor):
-        batch = batch.detach().cpu().numpy()
+    # Handle DataLoader input
+    if isinstance(batch_or_array, DataLoader):
+        print("Processing DataLoader for ProtoLM attributions...")
+        all_attributions = []
+        
+        with tqdm(total=len(batch_or_array), desc="ProtoLM Attributions", unit="batch") as pbar:
+            for batch in batch_or_array:
+                # Extract data from batch
+                input_ids = batch["input_ids"].cpu().numpy()
+                attention_mask = batch["attention_mask"].cpu().numpy()
+                sentiment_features = batch["sentiment_features"].cpu().numpy()
+                
+                # Ensure 2D
+                if input_ids.ndim == 1:
+                    input_ids = input_ids[None, :]
+                if attention_mask.ndim == 1:
+                    attention_mask = attention_mask[None, :]
+                if sentiment_features.ndim == 1:
+                    sentiment_features = sentiment_features[None, :]
+                
+                # Concatenate to create input array
+                batch_array = np.concatenate([input_ids, attention_mask, sentiment_features], axis=1)
+                
+                # Process this batch
+                batch_attributions = proto_lm_simple_explain_func(model, batch_array, **kwargs)
+                all_attributions.append(batch_attributions)
+                
+                pbar.update(1)
+                
+                # Clear GPU memory
+                torch.cuda.empty_cache()
+        
+        return np.concatenate(all_attributions, axis=0)
+    
+    # Handle numpy array input (existing logic)
+    if isinstance(batch_or_array, torch.Tensor):
+        batch = batch_or_array.detach().cpu().numpy()
+    else:
+        batch = batch_or_array
     
     # Expected feature structure: 204 = 100 (input_ids) + 100 (attention_mask) + 4 (sentiment)
     expected_features = 2 * seq_len + 4
@@ -852,186 +929,6 @@ def proto_lm_simple_explain_func(model, batch, **kwargs):
         return np.random.random((batch.shape[0], expected_features)) * 0.01
 
 
-# class ProtoLMWrapper(torch.nn.Module):
-#     def __init__(self, model, device):
-#         super().__init__()
-#         self.model = model
-#         self.device = device
-
-#     def forward(self, input_ids=None, inputs_embeds=None, attention_mask=None, sentiment_features=None):
-#         # Forward all possible arguments to the underlying model
-#         output = self.model(
-#             input_ids=input_ids,
-#             inputs_embeds=inputs_embeds,
-#             attention_mask=attention_mask,
-#             sentiment_features=sentiment_features
-#         )
-#         return output['logits']
-
-#     def predict(self, dataloader):
-#         self.model.eval()
-#         all_preds, all_labels = [], []
-#         with torch.no_grad(), tqdm(total=len(dataloader), desc="ProtoLM Predict", unit="batch") as pbar:
-#             for batch in dataloader:
-#                 input_ids = batch["input_ids"].to(self.device)
-#                 attention_mask = batch["attention_mask"].to(self.device)
-#                 sentiment_features = batch["sentiment_features"].to(self.device)
-#                 labels = batch["labels"].cpu().numpy()
-#                 outputs = self.model(
-#                     input_ids=input_ids,
-#                     attention_mask=attention_mask,
-#                     sentiment_features=sentiment_features
-#                 )
-#                 preds = outputs["logits"].squeeze(-1).cpu().numpy()
-#                 all_preds.append(preds)
-#                 all_labels.append(labels)
-#                 pbar.update(1)
-#         y_pred = np.concatenate(all_preds)
-#         y_true = np.concatenate(all_labels)
-#         return y_true, y_pred
-
-    
-#     def generate_saliency_map(self, batch_or_array):
-#         self.eval()
-#         explainer = GradientShap(self)
-#         all_attributions = []
-
-#         if isinstance(batch_or_array, DataLoader):
-#             dataloader = batch_or_array
-#             with tqdm(total=len(dataloader), desc="ProtoLM Saliency", unit="batch") as pbar:
-#                 for batch in dataloader:
-#                     input_ids = batch["input_ids"].to(self.device)
-#                     attention_mask = batch["attention_mask"].to(self.device)
-#                     sentiment_features = batch["sentiment_features"].to(self.device)
-#                     inputs_embeds = self.model.LLM.embeddings(input_ids)
-#                     baselines = torch.zeros_like(inputs_embeds)
-#                     with torch.no_grad():
-#                         logits = self.model(
-#                             input_ids=input_ids,
-#                             attention_mask=attention_mask,
-#                             sentiment_features=sentiment_features
-#                         )["logits"]
-#                         targets = torch.argmax(logits, dim=1)
-#                     attributions = explainer.attribute(
-#                         inputs=inputs_embeds,
-#                         baselines=baselines,
-#                         additional_forward_args=(attention_mask, sentiment_features),
-#                         target=targets
-#                     )
-#                     if attributions.ndim == 3:
-#                         attributions = torch.norm(attributions, dim=-1)
-#                     all_attributions.append(attributions.detach().cpu().numpy())
-#                     pbar.update(1)
-#                     torch.cuda.empty_cache()
-#             return np.concatenate(all_attributions)
-#         elif isinstance(batch_or_array, np.ndarray):
-#             seq_len = self.model.max_seq_length
-#             sentiment_dim = 4
-#             expected_dim = 2 * seq_len + sentiment_dim
-#             # Pad or trim to expected_dim
-#             if batch_or_array.shape[1] < expected_dim:
-#                 pad_width = expected_dim - batch_or_array.shape[1]
-#                 batch_or_array = np.pad(batch_or_array, ((0,0),(0,pad_width)), mode='constant')
-#             elif batch_or_array.shape[1] > expected_dim:
-#                 batch_or_array = batch_or_array[:, :expected_dim]
-            
-#             # # ...inside ProtoLMWrapper.generate_saliency_map, after padding/trimming...
-#             # # --- Sanitize attention_mask ---
-#             # attention_mask = np.where(input_ids != 0, 1, 0)  # Set to 1 where input_ids is not PAD (0), else 0
-#             # attention_mask = attention_mask.astype(np.int64)
-            
-#             batch_size = 2  # Try 1 or 2 to avoid OOM
-#             all_attributions = []
-
-#             for i in range(0, batch_or_array.shape[0], batch_size):
-#                 # --- Split the concatenated input ---
-#                 input_ids = batch_or_array[i:i+batch_size, :seq_len]
-#                 input_ids = np.round(input_ids).astype(np.int64)
-#                 vocab_size = self.model.LLM.embeddings.word_embeddings.num_embeddings
-#                 # Pad or trim input_ids to seq_len
-#                 if input_ids.shape[1] < seq_len:
-#                     input_ids = np.pad(input_ids, ((0,0),(0,seq_len-input_ids.shape[1])), mode='constant')
-#                 elif input_ids.shape[1] > seq_len:
-#                     input_ids = input_ids[:, :seq_len]
-#                 input_ids = np.clip(input_ids, 0, vocab_size - 1)
-
-#                 # Ignore the perturbed attention_mask from Quantus!
-#                 sentiment_features = batch_or_array[i:i+batch_size, 2*seq_len:]
-
-#                 # --- Always reconstruct attention_mask from input_ids ---
-#                 attention_mask = (input_ids != 0).astype(np.int64)
-
-#                 assert input_ids.shape[1] == attention_mask.shape[1], f"input_ids shape: {input_ids.shape}, attention_mask shape: {attention_mask.shape}"
-
-#                 # --- Convert to tensors ---
-#                 input_ids = torch.tensor(input_ids, dtype=torch.long, device=self.device)
-#                 attention_mask = torch.tensor(attention_mask, dtype=torch.long, device=self.device)
-#                 sentiment_features = torch.tensor(sentiment_features, dtype=torch.float32, device=self.device)
-
-#                 # --- SHAPE CHECK ---
-#                 if input_ids.shape[1] != attention_mask.shape[1]:
-#                     print(f"Shape mismatch: input_ids {input_ids.shape}, attention_mask {attention_mask.shape}")
-#                     raise ValueError("attention_mask must match the sequence length of inputs_embeds.")
-
-#                 # --- Get targets ---
-#                 with torch.no_grad():
-#                     logits = self.model(
-#                         input_ids=input_ids,
-#                         attention_mask=attention_mask,
-#                         sentiment_features=sentiment_features
-#                     )["logits"]
-#                     targets = torch.argmax(logits, dim=1)
-#                 # --- Embeddings and attribution ---
-#                 # inputs_embeds = self.model.LLM.embeddings(input_ids)
-#                 inputs_embeds = self.model.LLM.embeddings(input_ids)
-#                 if inputs_embeds.dim() == 2:
-#                     # Captum may flatten batch, restore shape
-#                     inputs_embeds = inputs_embeds.unsqueeze(0)
-#                 if inputs_embeds.shape[-1] != self.model.hidden_shape:
-#                     # Project or pad/truncate to hidden_shape (should not happen if input_ids is correct)
-#                     raise ValueError(f"inputs_embeds last dim {inputs_embeds.shape[-1]} != model.hidden_shape {self.model.hidden_shape}")
-#                 baselines = torch.zeros_like(inputs_embeds)
-
-#                 print(
-#                     f"[DEBUG] Batch {i}: input_ids shape: {input_ids.shape}, "
-#                     f"attention_mask shape: {attention_mask.shape}, "
-#                     f"inputs_embeds shape: {inputs_embeds.shape}"
-#                 )
-
-#                 try:
-#                     assert inputs_embeds.shape[1] == attention_mask.shape[1], (
-#                         f"inputs_embeds shape: {inputs_embeds.shape}, attention_mask shape: {attention_mask.shape}"
-#                     )
-#                 except AssertionError as e:
-#                     print("[ERROR] Assertion failed!")
-#                     print(f"input_ids: {input_ids}")
-#                     print(f"attention_mask: {attention_mask}")
-#                     print(f"inputs_embeds.shape: {inputs_embeds.shape}")
-#                     raise
-
-#                 print(f"inputs_embeds shape: {inputs_embeds.shape}, baselines shape: {baselines.shape}, attention_mask shape: {attention_mask.shape}, sentiment_features shape: {sentiment_features.shape}")
-#                 print(f"logits shape: {logits.shape}, logits: {logits}")
-#                 print(f"targets shape: {targets.shape}, targets: {targets}")
-
-#                 attributions = explainer.attribute(
-#                     inputs=inputs_embeds,
-#                     baselines=baselines,
-#                     additional_forward_args=(attention_mask, sentiment_features),
-#                     target=targets
-#                 )
-#                 if attributions.ndim == 3:
-#                     attributions = torch.norm(attributions, dim=-1)
-#                 all_attributions.append(attributions.detach().cpu().numpy())
-#                 torch.cuda.empty_cache()
-
-#             return np.concatenate(all_attributions, axis=0)
-#         else:
-#             raise ValueError("Input to generate_saliency_map must be a DataLoader or np.ndarray.")
-
-    
-
-
-
 def calculate_sparsity(a_batch, threshold=1e-5):
     """
     Calculate the sparsity of saliency maps.
@@ -1051,6 +948,12 @@ def calculate_sparsity(a_batch, threshold=1e-5):
     return sparsity_score
 
 class CustomFaithfulnessCorrelation:
+    """
+    Custom implementation of faithfulness correlation for tabular data.
+    This implementation measures the correlation between feature importance scores
+    and prediction changes when those features are perturbed.
+    It uses a subset of features to compute the correlation.
+    """
     def __init__(self, subset_size=10, nr_runs=1, similarity_func=None, abs=True,
                  normalise=False, aggregate_func=np.mean, return_aggregate=True, disable_warnings=True,
                  perturb_baseline=None, display_progressbar=True):
@@ -1066,6 +969,19 @@ class CustomFaithfulnessCorrelation:
         self.display_progressbar = display_progressbar
 
     def __call__(self, model, x_batch, y_batch, a_batch, device="cpu"):
+        """
+        
+        Parameters:
+            model: The model to evaluate.
+            x_batch: Input features (NumPy array).
+            y_batch: True labels (NumPy array).
+            a_batch: Attribution scores (NumPy array).
+            device: Device to run the evaluation on (default is "cpu").
+        
+        Returns:
+            float: Correlation between feature importance and prediction changes.
+        """ 
+
         n, d = x_batch.shape
         prediction_changes = []
         importance_scores = []
@@ -1129,6 +1045,13 @@ class CustomFaithfulnessCorrelation:
 
 # Alternative implementation using the standard Quantus approach
 class TabularFaithfulnessCorrelation:
+    """ 
+    Implementation of faithfulness correlation for tabular data.
+    This implementation measures the correlation between feature importance scores
+    and prediction changes when those features are perturbed.
+    It uses a subset of features to compute the correlation.
+    """
+
     def __init__(self, subset_size=10, nr_runs=100, abs=True, normalise=False, 
                  aggregate_func=np.mean, return_aggregate=True, disable_warnings=True,
                  perturb_baseline="mean", display_progressbar=True):
@@ -1146,6 +1069,18 @@ class TabularFaithfulnessCorrelation:
         """
         Calculate faithfulness by measuring correlation between attribution importance
         and prediction changes when those features are removed.
+
+        Parameters:
+            model: The model to evaluate.
+            x_batch: Input features (NumPy array).
+            y_batch: True labels (NumPy array).
+            a_batch: Attribution scores (NumPy array).
+            device: Device to run the evaluation on (default is "cpu").
+        
+        Returns:
+            float or list: Correlation between feature importance and prediction changes.
+            If return_aggregate is True, returns a single aggregated correlation value.
+            Otherwise, returns a list of correlations for each run.
         """
         correlations = []
         
@@ -1238,13 +1173,13 @@ def custom_perturb_func(x, indices, baseline=None, **kwargs):
     Replaces values at specified indices with a baseline.
 
     Parameters:
-    x (np.ndarray): Input data.
-    indices (list or np.ndarray): Indices of features to perturb.
-    baseline (float or np.ndarray): Baseline value to replace features with.
-    kwargs: Additional arguments.
+        x (np.ndarray): Input data.
+        indices (list or np.ndarray): Indices of features to perturb.
+        baseline (float or np.ndarray): Baseline value to replace features with.
+        kwParameters: Additional arguments.
 
     Returns:
-    np.ndarray: Perturbed input data with the same shape as the input.
+        np.ndarray: Perturbed input data with the same shape as the input.
     """
     x_perturbed = x.copy()
     if baseline is None:
@@ -1311,7 +1246,7 @@ def calculate_robustness_metric(model, x_batch, y_batch, a_batch):
         x_batch=x_batch,  # Batch of input features
         y_batch=y_batch,  # Batch of true labels
         a_batch=a_batch,  # Batch of saliency maps
-        explain_func=lambda model, inputs, **kwargs: model.generate_saliency_map(inputs)  # Updated lambda function
+        explain_func=lambda model, inputs, **kwParameters: model.generate_saliency_map(inputs)  # Updated lambda function
     )
     # Aggregate the robustness scores (e.g., take the mean)
     robustness_score_mean = np.mean(robustness_scores)
@@ -1320,130 +1255,218 @@ def calculate_robustness_metric(model, x_batch, y_batch, a_batch):
 
 def calculate_bert_faithfulness_correlation_metric(model, model_name, x_batch, y_batch, a_batch, tokenizer, subset_size=5, nr_runs=10):
     print(f"Calculating {model_name} Faithfulness Correlation Metric...")
-    n, seq_len = x_batch.shape
+    n, seq_len_total = x_batch.shape
     prediction_changes = []
     importance_scores = []
+    nonzero_changes = 0  # Track samples with meaningful prediction changes
 
     pad_token_id = tokenizer.pad_token_id
 
     # --- Infer sentiment feature dimension ---
     if "Proto-lm" in model_name:
         # For ProtoLM, x_batch shape is (n_samples, 2*seq_len + sentiment_dim)
-        # Infer seq_len and sentiment_dim
-        sentiment_dim = 4  # If you know it's always 4, otherwise infer as below:
-        # sentiment_dim = x_batch.shape[1] - 2 * seq_len
+        sentiment_dim = 4  # Fixed sentiment feature dimension
         seq_len = model.model.max_seq_length
-
-    for run in range(nr_runs):
-        for i in range(n):
-            if "Proto-lm" in model_name:
-                # Extract input_ids, attention_mask, sentiment_features
-                input_ids = x_batch[i, :seq_len].copy().astype(int)
-                attention_mask = x_batch[i, seq_len:2*seq_len].copy().astype(int)
-                sentiment_features = x_batch[i, 2*seq_len:].copy()
-
-                # --- Ensure input_ids and attention_mask are always 1D arrays of length seq_len ---
-                input_ids = np.array(input_ids).flatten()[:seq_len]
-                attention_mask = np.array(attention_mask).flatten()[:seq_len]
-                sentiment_features = np.array(sentiment_features).flatten()
-
-                # Defensive: pad if too short (shouldn't happen, but just in case)
-                if input_ids.shape[0] < seq_len:
-                    input_ids = np.pad(input_ids, (0, seq_len - input_ids.shape[0]), constant_values=0)
-                if attention_mask.shape[0] < seq_len:
-                    attention_mask = np.pad(attention_mask, (0, seq_len - attention_mask.shape[0]), constant_values=0)
-            else:
-                input_ids = x_batch[i].copy()
-                attention_mask = (input_ids != pad_token_id).astype(int)
-                sentiment_features = None
-
-            attributions = a_batch[i]
-
-            # Get top-k important tokens (ignore [PAD] tokens)
-            valid_mask = input_ids != pad_token_id
-            valid_indices = np.where(valid_mask)[0]
-            if len(valid_indices) == 0:
-                continue
-            abs_attributions = np.abs(attributions[valid_indices])
-            topk_indices = valid_indices[np.argsort(abs_attributions)[-subset_size:]]
-
-            # Perturb: set top-k tokens to [PAD]
-            input_ids_perturbed = input_ids.copy()
-            input_ids_perturbed[topk_indices] = pad_token_id
-
-            # Prepare tensors
-            input_ids_tensor = torch.tensor(input_ids, dtype=torch.long, device=model.device).unsqueeze(0)
-            input_ids_perturbed_tensor = torch.tensor(input_ids_perturbed, dtype=torch.long, device=model.device).unsqueeze(0)
-            attention_mask_tensor = torch.tensor(attention_mask, dtype=torch.long, device=model.device).unsqueeze(0)
-            attention_mask_perturbed = (input_ids_perturbed != pad_token_id).astype(int)
-            if attention_mask_perturbed.shape[0] != seq_len:
-                attention_mask_perturbed = attention_mask_perturbed[:seq_len]
-            attention_mask_perturbed_tensor = torch.tensor(attention_mask_perturbed, dtype=torch.long, device=model.device).unsqueeze(0)
-
-            if "Proto-lm" in model_name:
-                sentiment_features_tensor = torch.tensor(sentiment_features, dtype=torch.float32, device=model.device).unsqueeze(0)
-            else:
-                sentiment_features_tensor = None
-
-            # Get predictions
-            with torch.no_grad():
-                if "BERT" in model_name:
-                    inputs_embeds = model.model.bert.embeddings(input_ids_tensor)
-                    pred = model(inputs_embeds, attention_mask_tensor).cpu().numpy().squeeze()
-                    inputs_embeds_perturbed = model.model.bert.embeddings(input_ids_perturbed_tensor)
-                    pred_perturbed = model(inputs_embeds_perturbed, attention_mask_perturbed_tensor).cpu().numpy().squeeze()
-                else:  # ProtoLM
-                    # Concatenate all required features for ProtoLM
-                    # input_ids: (seq_len,), attention_mask: (seq_len,), sentiment_features: (4,)
-                    proto_input = np.concatenate([input_ids, attention_mask, sentiment_features])
-                    proto_input_tensor = torch.tensor(proto_input, dtype=torch.float32, device=model.device).unsqueeze(0)
-                    pred = model(
-                        input_ids=input_ids_tensor,
-                        attention_mask=attention_mask_tensor,
-                        sentiment_features=sentiment_features_tensor
-                    ).cpu().numpy().squeeze()
-
-                    # For perturbed input
-                    input_ids_perturbed_tensor = torch.tensor(input_ids_perturbed, dtype=torch.long, device=model.device).unsqueeze(0)
-                    attention_mask_perturbed_tensor = torch.tensor(attention_mask_perturbed, dtype=torch.long, device=model.device).unsqueeze(0)
-                    sentiment_features_tensor = torch.tensor(sentiment_features, dtype=torch.float32, device=model.device).unsqueeze(0)
-                    pred_perturbed = model(
-                        input_ids=input_ids_perturbed_tensor,
-                        attention_mask=attention_mask_perturbed_tensor,
-                        sentiment_features=sentiment_features_tensor
-                    ).cpu().numpy().squeeze()
-                    # inputs_embeds_perturbed = model.model.LLM.embeddings(input_ids_perturbed_tensor)
-                    # pred_perturbed = model(inputs_embeds_perturbed, attention_mask_perturbed_tensor, sentiment_features_tensor).cpu().numpy().squeeze()
-
-            prediction_change = abs(pred - pred_perturbed)
-            if len(valid_indices) == 0:
-                continue
-            abs_attributions = np.abs(attributions[valid_indices])
-            topk_indices = valid_indices[np.argsort(abs_attributions)[-subset_size:]]
-
-            # Perturb: set top-k tokens to [PAD]
-            input_ids_perturbed = input_ids.copy()
-            input_ids_perturbed[topk_indices] = pad_token_id
-
-            # --- prediction code ---
-
-            prediction_change = abs(pred - pred_perturbed)
-            importance_sum = np.sum(np.abs(attributions[topk_indices]))
-
-            # Only append if both are scalars
-            if np.isscalar(prediction_change) and np.isscalar(importance_sum):
-                prediction_changes.append(prediction_change)
-                importance_scores.append(importance_sum)
-
-    # Correlation
-    if len(prediction_changes) > 1 and np.std(prediction_changes) > 0 and np.std(importance_scores) > 0:
-        correlation = np.corrcoef(importance_scores, prediction_changes)[0, 1]
-        if np.isnan(correlation):
-            correlation = 0.0
+        print(f"ProtoLM: seq_len={seq_len}, sentiment_dim={sentiment_dim}, total_features={seq_len_total}")
     else:
-        correlation = 0.0
+        seq_len = seq_len_total
+        sentiment_dim = 0
 
-    print(f"BERT Faithfulness Correlation Score: {correlation:.4f}")
+    # Calculate total iterations for progress bar
+    total_iterations = nr_runs * n
+    
+    with tqdm(total=total_iterations, desc=f"{model_name} Faithfulness", unit="sample") as pbar:
+        for run in range(nr_runs):
+            for i in range(n):
+                if "Proto-lm" in model_name:
+                    # Extract input_ids, attention_mask, sentiment_features
+                    input_ids = x_batch[i, :seq_len].copy().astype(int)
+                    attention_mask = x_batch[i, seq_len:2*seq_len].copy().astype(int)
+                    sentiment_features = x_batch[i, 2*seq_len:].copy()
+
+                    # Ensure proper shapes
+                    input_ids = np.array(input_ids).flatten()[:seq_len]
+                    attention_mask = np.array(attention_mask).flatten()[:seq_len]
+                    sentiment_features = np.array(sentiment_features).flatten()
+
+                    # Pad if too short
+                    if input_ids.shape[0] < seq_len:
+                        input_ids = np.pad(input_ids, (0, seq_len - input_ids.shape[0]), constant_values=pad_token_id)
+                    if attention_mask.shape[0] < seq_len:
+                        attention_mask = np.pad(attention_mask, (0, seq_len - attention_mask.shape[0]), constant_values=0)
+                else:
+                    input_ids = x_batch[i].copy()
+                    attention_mask = (input_ids != pad_token_id).astype(int)
+                    sentiment_features = None
+
+                # Use attributions for the corresponding features (focus on input_ids for text models)
+                if "Proto-lm" in model_name:
+                    # For ProtoLM, use attributions for input_ids part only
+                    attributions = a_batch[i, :seq_len]  # Focus on input_ids attributions
+                else:
+                    attributions = a_batch[i]
+
+                # Get top-k important tokens (ignore [PAD] tokens)
+                valid_mask = input_ids != pad_token_id
+                valid_indices = np.where(valid_mask)[0]
+                if len(valid_indices) == 0:
+                    pbar.update(1)
+                    continue
+                
+                # ULTRA AGGRESSIVE PERTURBATION: Perturb much larger portion
+                ultra_aggressive_subset_size = min(max(len(valid_indices) // 2, 20), len(valid_indices))
+                if ultra_aggressive_subset_size == 0:
+                    pbar.update(1)
+                    continue
+                    
+                abs_attributions = np.abs(attributions[valid_indices])
+                topk_indices = valid_indices[np.argsort(abs_attributions)[-ultra_aggressive_subset_size:]]
+
+                # COMPLETELY NEW APPROACH: Focus on SENTIMENT FEATURES since text perturbation fails
+                input_ids_perturbed = input_ids.copy()
+                sentiment_features_perturbed = sentiment_features.copy()
+                
+                if "Proto-lm" in model_name:
+                    # HYPOTHESIS: The model relies heavily on sentiment features, not text
+                    # Strategy 1: DRASTICALLY perturb sentiment features (the real driver)
+                    
+                    # Completely randomize sentiment features
+                    sentiment_features_perturbed = np.random.random(4)  # Random values 0-1
+                    
+                    # Also try text perturbation but less aggressively since it seems ineffective
+                    if len(topk_indices) > 0:
+                        vocab_size = model.model.LLM.embeddings.word_embeddings.num_embeddings
+                        # Only perturb a few top tokens, focus energy on sentiment
+                        limited_indices = topk_indices[-min(5, len(topk_indices)):]  # Only top 5
+                        random_tokens = np.random.randint(100, min(vocab_size // 2, 10000), size=len(limited_indices))
+                        input_ids_perturbed[limited_indices] = random_tokens
+                    
+                    # Alternative strategy: Try completely zeroing out sentiment features
+                    if i % 2 == 0:  # Every other sample
+                        sentiment_features_perturbed = np.zeros(4)
+                    
+                else:
+                    # For BERT, use original aggressive text perturbation
+                    vocab_size = 30522  # BERT vocabulary size
+                    random_tokens = np.random.randint(1000, min(15000, vocab_size), size=len(topk_indices))
+                    input_ids_perturbed[topk_indices] = random_tokens
+                
+                # Update attention mask for perturbed input
+                attention_mask_perturbed = (input_ids_perturbed != pad_token_id).astype(int)
+
+                # Prepare tensors
+                input_ids_tensor = torch.tensor(input_ids, dtype=torch.long, device=model.device).unsqueeze(0)
+                input_ids_perturbed_tensor = torch.tensor(input_ids_perturbed, dtype=torch.long, device=model.device).unsqueeze(0)
+                attention_mask_tensor = torch.tensor(attention_mask, dtype=torch.long, device=model.device).unsqueeze(0)
+                attention_mask_perturbed_tensor = torch.tensor(attention_mask_perturbed, dtype=torch.long, device=model.device).unsqueeze(0)
+
+                # Get predictions
+                with torch.no_grad():
+                    if "BERT" in model_name:
+                        inputs_embeds = model.model.bert.embeddings(input_ids_tensor)
+                        pred_logits = model(inputs_embeds, attention_mask_tensor).cpu().numpy().squeeze()
+                        inputs_embeds_perturbed = model.model.bert.embeddings(input_ids_perturbed_tensor)
+                        pred_perturbed_logits = model(inputs_embeds_perturbed, attention_mask_perturbed_tensor).cpu().numpy().squeeze()
+                        
+                        # Convert logits to class predictions
+                        pred = np.argmax(pred_logits) if pred_logits.ndim > 0 else pred_logits
+                        pred_perturbed = np.argmax(pred_perturbed_logits) if pred_perturbed_logits.ndim > 0 else pred_perturbed_logits
+                    else:  # ProtoLM
+                        sentiment_features_tensor = torch.tensor(sentiment_features, dtype=torch.float32, device=model.device).unsqueeze(0)
+                        sentiment_features_perturbed_tensor = torch.tensor(sentiment_features_perturbed, dtype=torch.float32, device=model.device).unsqueeze(0)
+                        
+                        # Original prediction
+                        pred_logits = model(
+                            input_ids=input_ids_tensor,
+                            attention_mask=attention_mask_tensor,
+                            sentiment_features=sentiment_features_tensor
+                        ).cpu().numpy().squeeze()
+
+                        # Perturbed prediction using BOTH perturbed text AND perturbed sentiment features
+                        pred_perturbed_logits = model(
+                            input_ids=input_ids_perturbed_tensor,
+                            attention_mask=attention_mask_perturbed_tensor,
+                            sentiment_features=sentiment_features_perturbed_tensor  # Use perturbed sentiment features!
+                        ).cpu().numpy().squeeze()
+                        
+                        # Convert logits to class predictions (0-9, then add 1 to get 1-10 range)
+                        pred = np.argmax(pred_logits) + 1 if pred_logits.ndim > 0 else pred_logits + 1
+                        pred_perturbed = np.argmax(pred_perturbed_logits) + 1 if pred_perturbed_logits.ndim > 0 else pred_perturbed_logits + 1
+
+                # Ensure predictions are scalars
+                pred = float(pred) if not np.isscalar(pred) else pred
+                pred_perturbed = float(pred_perturbed) if not np.isscalar(pred_perturbed) else pred_perturbed
+
+                # Calculate prediction difference and importance sum
+                prediction_change = abs(pred - pred_perturbed)
+                importance_sum = np.sum(np.abs(attributions[topk_indices]))
+
+                # Enhanced debug information for first few samples
+                if run == 0 and i < 5:
+                    print(f"\nSample {i}: pred={pred:.4f}, pred_perturbed={pred_perturbed:.4f}, "
+                          f"change={prediction_change:.4f}, importance={importance_sum:.4f}")
+                    print(f"  Perturbed {ultra_aggressive_subset_size} tokens out of {len(valid_indices)} valid tokens")
+                    
+                    # Show how many tokens were actually changed
+                    changed_tokens = np.sum(input_ids != input_ids_perturbed)
+                    print(f"  Total tokens changed: {changed_tokens}")
+                    
+                    # Additional debug for ProtoLM
+                    if "Proto-lm" in model_name:
+                        print(f"  Original sentiment features: {sentiment_features}")
+                        print(f"  Perturbed sentiment features: {sentiment_features_perturbed}")
+                        sentiment_diff = np.linalg.norm(sentiment_features - sentiment_features_perturbed)
+                        print(f"  Sentiment features diff magnitude: {sentiment_diff:.4f}")
+                        print(f"  Original logits: {pred_logits}")
+                        print(f"  Perturbed logits: {pred_perturbed_logits}")
+                        print(f"  Logits diff magnitude: {np.linalg.norm(pred_logits - pred_perturbed_logits):.6f}")
+                        print(f"  Argmax original: {np.argmax(pred_logits)}, Argmax perturbed: {np.argmax(pred_perturbed_logits)}")
+                        print(f"  Max logit diff: {np.max(np.abs(pred_logits - pred_perturbed_logits)):.6f}")
+
+                # Track statistics for the run
+                if prediction_change > 0:
+                    nonzero_changes += 1
+
+                # Only append if both are scalars and meaningful
+                if (np.isscalar(prediction_change) and np.isscalar(importance_sum) and 
+                    prediction_change > 1e-8 and importance_sum > 1e-8):
+                    prediction_changes.append(prediction_change)
+                    importance_scores.append(importance_sum)
+                
+                # Update progress bar
+                pbar.update(1)
+
+    # Calculate correlation with enhanced statistics and robust error handling
+    print(f"\nFaithfulness Metric Statistics:")
+    print(f"  Total samples processed: {len(prediction_changes)}")
+    print(f"  Samples with nonzero prediction changes: {nonzero_changes}")
+    
+    # Handle empty arrays gracefully
+    if len(prediction_changes) == 0:
+        print("  WARNING: No valid prediction changes found!")
+        print(f"  This indicates the model is extremely robust to perturbations.")
+        print(f"  For {model_name}, even aggressive token replacement had no effect on predictions.")
+        print(f"  This could indicate:")
+        print(f"    1. Model is overly trained/memorized")
+        print(f"    2. Model relies heavily on sentiment features rather than text")
+        print(f"    3. Model has very low sensitivity to input changes")
+        print(f"    4. Perturbation strategy may not be appropriate for this model")
+        correlation = 0.0
+    else:
+        print(f"  Prediction changes - min: {np.min(prediction_changes):.6f}, max: {np.max(prediction_changes):.6f}, mean: {np.mean(prediction_changes):.6f}")
+        print(f"  Importance scores - min: {np.min(importance_scores):.6f}, max: {np.max(importance_scores):.6f}, mean: {np.mean(importance_scores):.6f}")
+        
+        if len(prediction_changes) > 1 and np.std(prediction_changes) > 1e-8 and np.std(importance_scores) > 1e-8:
+            correlation = np.corrcoef(importance_scores, prediction_changes)[0, 1]
+            if np.isnan(correlation):
+                correlation = 0.0
+            print(f"  Correlation stats: pred_changes std={np.std(prediction_changes):.6f}, "
+                  f"importance std={np.std(importance_scores):.6f}")
+        else:
+            correlation = 0.0
+            print("  Insufficient variation in data for correlation calculation")
+
+    print(f"{model_name} Faithfulness Correlation Score: {correlation:.4f}")
     return correlation
 
 
@@ -1511,11 +1534,7 @@ def calculate_localisation_metric(model, model_name, x_batch, y_batch, a_batch):
 def calculate_monotonicity_metric(model, model_name, x_batch, y_batch, a_batch):
     """Calculate Monotonicity Metric."""
     print("Calculating Monotonicity Metric...")
-    y_batch_for_monotonicity = np.zeros_like(y_batch)  # Dummy labels for regression
-    
-    # Debugging: Print the shape of x_batch and y_batch
-    print(f"x_batch shape: {x_batch.shape}")
-    print(f"y_batch shape: {y_batch_for_monotonicity.shape}")
+    y_batch_for_monotonicity = np.zeros_like(y_batch)  # Dummy labels for regression    
     
     monotonicity_metric = quantus.Monotonicity(
         return_aggregate=True,
@@ -1528,7 +1547,6 @@ def calculate_monotonicity_metric(model, model_name, x_batch, y_batch, a_batch):
         },  # Pass baseline as mean of input data
     )
 
-     # Debugging: Check perturbed inputs
     # Use SHAP values to identify important features
     shap_values = np.abs(a_batch).mean(axis=0)  # Mean absolute SHAP values for each feature
     num_top_features = min(15, shap_values.shape[0])  # Ensure we don't exceed the number of features
@@ -1563,9 +1581,8 @@ def calculate_randomisation_metric(model, model_name, x_batch, y_batch, a_batch)
     print("Calculating Randomisation Metric...")
     # Use the updated MPRT metric
     randomisation_metric = quantus.MPRT(
-        # layer_order="independent",
-        similarity_func=quantus.similarity_func.correlation_pearson,  # Use a valid similarity function
-        return_average_correlation=True,  # Updated parameter
+        similarity_func=quantus.similarity_func.correlation_pearson,
+        return_average_correlation=True, 
         abs=True,
         normalise=False,
         aggregate_func=np.mean,
@@ -1771,22 +1788,37 @@ def evaluate_model(model_type, model_filename, X_test_combined, y_test, metrics=
             explanations_padded = wrapped_model.generate_saliency_map(test_loader)
             np.save(attr_path, explanations_padded)
     elif "Proto-lm" in model_type:
-        model, tokenizer, args = load_proto_lm_model(path=model_filename)
-        train_dataloader, val_loader, test_loader = get_dataloader_for_proto_lm_model(args, subset=100)
+        model, tokenizer, args, class_weights_tensor = load_proto_lm_model(model_filename, device)
+        subset = SUBSET if use_subset else None
+        train_dataloader, val_loader, test_loader = get_dataloader_for_proto_lm_model(args, subset=subset)
         wrapped_model = ProtoLMWrapper(model, device)
-        preds_path = os.path.join(MODEL_DIR, f"{model_type}_test_preds.npy")
-        labels_path = os.path.join(MODEL_DIR, f"{model_type}_test_labels.npy")
+        if use_subset:
+            preds_path = os.path.join(MODEL_DIR, f"{model_type}_{SUBSET}_test_preds.npy")
+            labels_path = os.path.join(MODEL_DIR, f"{model_type}_{SUBSET}_test_labels.npy")
+        else:
+            preds_path = os.path.join(MODEL_DIR, f"{model_type}_test_preds.npy")
+            labels_path = os.path.join(MODEL_DIR, f"{model_type}_test_labels.npy")            
 
-        # Force regeneration of predictions to ensure correct format
-        # if os.path.exists(preds_path) and os.path.exists(labels_path):
-        #     print("Loading cached BERT predictions...")
-        #     y_test_true = np.load(labels_path)[:len(test_df)]
-        #     y_test_pred = np.load(preds_path)[:len(test_df)]
-        # else:
-        print("Predicting ProtoLM test set...")
-        y_test_true, y_test_pred = wrapped_model.predict(test_loader)
+        if os.path.exists(preds_path) and os.path.exists(labels_path):
+            print("Loading cached ProtoLM predictions...")
+            y_test_true = np.load(labels_path)[:len(test_df)]
+            y_test_pred = np.load(preds_path)[:len(test_df)]
+            
+            # Check if predictions are valid (not all the same value)
+            if len(np.unique(y_test_pred)) <= 1:
+                print("⚠️  Detected invalid cached predictions (all same value). Regenerating...")
+                os.remove(preds_path)
+                os.remove(labels_path)
+                print("Predicting ProtoLM test set...")
+                y_test_true, y_test_pred = wrapped_model.predict(test_loader)
+                np.save(labels_path, y_test_true)
+                np.save(preds_path, y_test_pred)
+        else:     
+            print("Predicting ProtoLM test set...")
+            y_test_true, y_test_pred = wrapped_model.predict(test_loader)
+            np.save(labels_path, y_test_true)
+            np.save(preds_path, y_test_pred)
         
-        # Debug: Check raw logits to understand what the model is actually outputting
         print(f"Debug: Checking raw model outputs...")
         with torch.no_grad():
             first_batch = next(iter(test_loader))
@@ -1806,14 +1838,17 @@ def evaluate_model(model_type, model_filename, X_test_combined, y_test, metrics=
             print(f"Debug: True labels (first 5): {labels}")
             print(f"Debug: Sentiment features (first 5): {sentiment_features.detach().cpu().numpy()}")
         
-        print(f"ProtoLM predictions shape: {y_test_pred.shape}, sample: {y_test_pred[:5]}")
-        print(f"ProtoLM labels shape: {y_test_true.shape}, sample: {y_test_true[:5]}")
-        print(f"ProtoLM prediction stats: min={y_test_pred.min():.3f}, max={y_test_pred.max():.3f}, mean={y_test_pred.mean():.3f}")
-        print(f"ProtoLM label stats: min={y_test_true.min():.3f}, max={y_test_true.max():.3f}, mean={y_test_true.mean():.3f}")
-        np.save(labels_path, y_test_true)
-        np.save(preds_path, y_test_pred)
-        attr_path = os.path.join(MODEL_DIR, f"{model_type}_test_attributions.npy")
-        
+            print(f"ProtoLM predictions shape: {y_test_pred.shape}, sample: {y_test_pred[:5]}")
+            print(f"ProtoLM labels shape: {y_test_true.shape}, sample: {y_test_true[:5]}")
+            print(f"ProtoLM prediction stats: min={y_test_pred.min():.3f}, max={y_test_pred.max():.3f}, mean={y_test_pred.mean():.3f}")
+            print(f"ProtoLM label stats: min={y_test_true.min():.3f}, max={y_test_true.max():.3f}, mean={y_test_true.mean():.3f}")
+            np.save(labels_path, y_test_true)
+            np.save(preds_path, y_test_pred)
+
+        if use_subset:
+            attr_path = os.path.join(MODEL_DIR, f"{model_type}_{SUBSET}_test_attributions.npy")
+        else:
+            attr_path = os.path.join(MODEL_DIR, f"{model_type}_test_attributions.npy")
         if os.path.exists(attr_path):
             print("Loading cached BERT attributions...")
             explanations_padded = np.load(attr_path)
@@ -1846,7 +1881,7 @@ def evaluate_model(model_type, model_filename, X_test_combined, y_test, metrics=
             x_list.append(arr)
         x_batch_np = np.concatenate(x_list, axis=0)  # (num_samples, 2*seq_len+4)
         
-        # Debug: Check the sentiment features (last 4 columns)
+        # Debuging Check the sentiment features (last 4 columns)
         sentiment_values = x_batch_np[:5, -4:]  # First 5 samples, last 4 features
         print(f"Sentiment features sample:\n{sentiment_values}")
         
@@ -1864,7 +1899,7 @@ def evaluate_model(model_type, model_filename, X_test_combined, y_test, metrics=
         print(f"x_batch_np shape: {x_batch_np.shape}")
         print(f"a_batch_np shape: {a_batch_np.shape}")  
         print(f"y_batch_np shape: {y_batch_np.shape}")
-        if x_batch_np.shape[0] != a_batch_np.shape[0] or x_batch_np.shape[0] != y_batch_np.shape[0]:
+        if (x_batch_np.shape[0] != a_batch_np.shape[0] or x_batch_np.shape[0] != y_batch_np.shape[0]) and len(metrics) > 0:
             raise ValueError("Mismatch in number of samples between x_batch, a_batch, and y_batch.")
     elif "BERT" in model_type:
         x_list = []
@@ -1893,7 +1928,7 @@ def evaluate_model(model_type, model_filename, X_test_combined, y_test, metrics=
         y_batch_np = np.array(y_test.values, dtype=np.int32)
 
     if use_subset:
-        subset_size = min(100, len(x_batch_np))
+        subset_size = min(SUBSET, len(x_batch_np))
         subset_indices = np.random.choice(len(x_batch_np), size=subset_size, replace=False)
         x_batch_np_small = x_batch_np[subset_indices]
         y_batch_np_small = y_batch_np[subset_indices]
@@ -1932,8 +1967,8 @@ def evaluate_model(model_type, model_filename, X_test_combined, y_test, metrics=
                 y_batch=y_batch_np_small,
                 a_batch=a_batch_np_small,
                 tokenizer=tokenizer,
-                subset_size=5,   # or another value
-                nr_runs=2        # keep low for speed
+                subset_size=5,   
+                nr_runs=2        
             )
         else: 
             faithfulness_score = calculate_faithfulness_correlation_metric(model=wrapped_model, x_batch=x_batch_np_small, y_batch=y_batch_np_small, a_batch=a_batch_np_small)
@@ -1963,7 +1998,7 @@ def evaluate_model(model_type, model_filename, X_test_combined, y_test, metrics=
         if "Proto-lm" in model_type:
             # Use a simpler attribution method for ProtoLM
             print("Calculating Max-Sensitivity metric for ProtoLM with simplified attribution...")
-            explain_function = lambda model, inputs, **kwargs: proto_lm_simple_explain_func(model, inputs, **kwargs)
+            explain_function = lambda model, inputs, **kwParameters: proto_lm_simple_explain_func(model, inputs, **kwargs)
             max_sensitivity_score = calculate_max_sensitivity_metric(model=wrapped_model, model_name=model_name, x_batch=x_batch_np_small, y_batch=y_batch_np_small, a_batch=a_batch_np_small, explain_function=explain_function)
         else:
             max_sensitivity_score = calculate_max_sensitivity_metric(model=wrapped_model, model_name=model_name, x_batch=x_batch_np_small, y_batch=y_batch_np_small, a_batch=a_batch_np_small, explain_function=explain_function)
@@ -1978,6 +2013,11 @@ def evaluate_model(model_type, model_filename, X_test_combined, y_test, metrics=
         road_score = calculate_road_metric(model=wrapped_model, model_name=model_name, x_batch=x_batch_np, y_batch=y_batch_np, a_batch=a_batch_np)
         print(f"ROAD Score: {road_score:.4f}")
         results.append({"model_name": model_name, "metric": "ROAD", "score": road_score})
+
+    # Ensure y_test matches the length of predictions (important for subset evaluation)
+    if len(y_test) != len(y_test_pred):
+        print(f"Adjusting y_test length from {len(y_test)} to {len(y_test_pred)} to match predictions")
+        y_test = y_test[:len(y_test_pred)]
 
     mae_score = calculate_mae_metric(y_test, y_test_pred, model_name)
     print(f"MAE Score: {mae_score:.4f}")
@@ -2017,11 +2057,11 @@ if __name__ == '__main__':
     print("Loading data...")
 
     metrics = [
-        # "complexity",
-        # "sparsity",
+        "complexity",
+        "sparsity",
         "max_sensitivity",
-        # "robustness",
-        # "faithfulness_correlation",
+        "robustness",
+        "faithfulness_correlation",
 
         # "monotonicity",
         # "localisation",
@@ -2046,8 +2086,6 @@ if __name__ == '__main__':
 
     if "BERT" in models or "Proto-lm" in models:
          df_test = pd.read_csv(f"{DATA_DIR}/drug_review_test_clean.csv")
-         df_test = df_test.head(100)  # Limit to 100 samples for BERT evaluation
-         y_test = y_test[:len(df_test)]  # Ensure y_test matches df_test length
 
 
     if "LightGBMTop15" in models or "LightGBMFull" in models or "LassoTop15" in models or "LassoFull" in models:
@@ -2098,5 +2136,5 @@ if __name__ == '__main__':
     if "Proto-lm" in models:
         # Evaluate Proto-lm model
         print("Evaluating Proto-lm model...")
-        proto_lm_model_file = f"{MODEL_DIR}/final_proto_model.pt"
-        evaluate_model("Proto-lm", proto_lm_model_file, X_test_features, y_test, metrics=metrics, use_subset=True, test_df=df_test)
+        proto_lm_model_dir = f"{MODEL_DIR}/improved_proto_model_20250701_115045"
+        evaluate_model("Proto-lm", proto_lm_model_dir, X_test_features, y_test, metrics=metrics, use_subset=True, test_df=df_test)

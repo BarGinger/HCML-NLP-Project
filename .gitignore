@@ -15,3 +15,4 @@ Data/X_test_combined.csv
 Data/X_train_combined.csv
 Data/X_val_combined.csv
 Models/bert_model/model.safetensors
+*.zip

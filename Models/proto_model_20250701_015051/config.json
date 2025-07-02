@@ -1,0 +1,15 @@
+{
+  "model_name": "bert-base-uncased",
+  "max_seq_length": 100,
+  "num_prototypes": 200,
+  "hidden_shape": 768,
+  "num_classes": 10,
+  "cohsep_ratio": 0.5,
+  "lambda0": 0.1,
+  "lr": 0.0001,
+  "proto_training_weights": 1,
+  "batch_size": 128,
+  "max_epochs": 10,
+  "timestamp": "20250701_015051",
+  "model_type": "ProtoLM_classification"
+}
